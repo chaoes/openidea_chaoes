@@ -13,7 +13,9 @@ interface workspace {
         read-file: func(path: string) -> result<string, error>;
         /// Project files whose root-relative path matches `glob` (`**/*Mapper.xml`),
         /// at most `limit`, as absolute paths. Ignored and excluded files are
-        /// skipped. Requires `project.read`.
+        /// skipped, and so are files in hidden folders (`.idea`, `.git`) — unless
+        /// the pattern names one (`.idea/libraries/*.xml`), which reads that
+        /// folder even when it is ignored. Requires `project.read`.
         find-files: func(glob: string, limit: u32) -> result<list<string>, error>;
         /// Writes `bytes` to a file inside the project (absolute, or relative to
         /// the root); paths leaving the root are refused and missing parent

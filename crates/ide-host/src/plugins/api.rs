@@ -630,21 +630,34 @@ impl HostApi for PluginApi {
             .build()
             .map_err(|e| HostError::Invalid(format!("{glob:?}: {e}")))?
             .compile_matcher();
-        // Hidden files and folders are left out, as in the walk below.
+        // Hidden files and folders are left out, as in the walk below — unless the pattern names
+        // one (`.idea/libraries/*.xml`): a project's own metadata lives in a hidden folder, and a
+        // plugin that cannot read it cannot see what the project is made of.
         let visible = |rel: &Path| !rel.iter().any(|c| c.to_str().is_some_and(|c| c.starts_with('.')));
+        let named = |segment: &&str| segment.starts_with('.');
+        let names_hidden = glob.split(['/', '\\']).any(|segment| named(&segment));
         // The project index already lists the files: walking a large tree on every call can take
-        // longer than an editor provider's deadline (the plugin is then stopped as crashed).
-        if let Some(files) = self
-            .shared
-            .workspace()
-            .and_then(|w| w.indexed_files(root, &|rel| visible(rel) && matcher.is_match(rel), limit))
+        // longer than an editor provider's deadline (the plugin is then stopped as crashed). It
+        // leaves hidden folders out, so a pattern that names one has to walk the disk.
+        if !names_hidden
+            && let Some(files) = self
+                .shared
+                .workspace()
+                .and_then(|w| w.indexed_files(root, &|rel| visible(rel) && matcher.is_match(rel), limit))
         {
             let mut out: Vec<String> = files.iter().map(|p| to_ipc(p)).collect();
             out.sort();
             return Ok(out);
         }
         let mut out = Vec::new();
-        for (n, entry) in ignore::WalkBuilder::new(root).hidden(true).build().flatten().enumerate() {
+        // A pattern that names a hidden folder is a request for that folder, so the ignore rules
+        // that keep a `.idea` out of a walk do not apply to it either.
+        let mut walk = ignore::WalkBuilder::new(root);
+        walk.hidden(!names_hidden);
+        if names_hidden {
+            walk.git_ignore(false).git_global(false).git_exclude(false).ignore(false);
+        }
+        for (n, entry) in walk.build().flatten().enumerate() {
             if n >= MAX_WALK || out.len() >= limit {
                 break;
             }
@@ -1321,6 +1334,23 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("a.xml"), "").unwrap();
         assert_eq!(api.find_files(&other, "*.xml", 10).unwrap(), [to_ipc(&other.join("a.xml"))]);
+    }
+
+    #[test]
+    fn find_files_can_name_a_hidden_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".idea/libraries")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".idea/libraries/Module_Public_Library.xml"), "").unwrap();
+        std::fs::write(root.join("src/App.java"), "").unwrap();
+        let api = api(&root, Arc::default());
+        // Not named: hidden folders stay out, as before.
+        assert!(api.find_files(&root, "**/*.xml", 10).unwrap().is_empty());
+        assert_eq!(
+            api.find_files(&root, ".idea/libraries/*.xml", 10).unwrap(),
+            [to_ipc(&root.join(".idea/libraries/Module_Public_Library.xml"))]
+        );
     }
 
     #[test]
