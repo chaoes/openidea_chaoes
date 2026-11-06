@@ -1947,6 +1947,9 @@ impl PluginHost {
             *runtime = None;
         }
         actor.stop(false);
+        // Its handles go with the instance: a reclaimed plugin's processes are
+        // ended too (it restarts on its next event).
+        self.shared.kill_processes(plugin.id());
         let mut meta = plugin.meta.lock();
         if meta.status == PluginStatus::Active {
             meta.status = PluginStatus::Inactive;

@@ -6,7 +6,8 @@
 use crate::types::{CodeAction, CompletionItem, InlineSuggestion, LineMarker, Location, ProviderDocument};
 use crate::types::{
     DirEntryInfo, EventKind, HostError, HttpRequest, HttpResponse, Invocation, Limits, NotificationLevel, PathKind,
-    ProcessOutput, RepositoryStatus, StatusItem, SyntaxFold, SyntaxSymbol, SyntaxToken, WorkbenchEvent,
+    ProcessChunk, ProcessCommand, ProcessOutput, RepositoryStatus, StatusItem, SyntaxFold, SyntaxSymbol, SyntaxToken,
+    WorkbenchEvent,
 };
 use crate::types::{
     FieldValue, View, ViewBody, ViewButton, ViewEvent, ViewField, ViewListItem, ViewTable, ViewTreeItem, Viewport,
@@ -34,7 +35,7 @@ use views_bindings::exports::openidea::plugin::view_provider as wit_view;
 use views_bindings::openidea::plugin::view_types as wit_vt;
 
 /// The API version of the world above, `major.minor` of [`host_api`].
-pub const API_VERSION: &str = "1.6";
+pub const API_VERSION: &str = "1.7";
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 pub(crate) const MAX_TEXT: usize = 1 << 20;
 pub(crate) const MAX_TITLE: usize = 256;
@@ -89,16 +90,39 @@ pub trait HostApi: Send + Sync {
     /// Performs `request` (its host is granted), filling in secret placeholders.
     fn fetch(&self, request: HttpRequest, cancel: &CancellationToken) -> Result<HttpResponse, HostError>;
     fn secret_is_set(&self, name: &str) -> bool;
-    /// Runs the approved file of `process:<program>`.
+    /// Runs the approved file of `process:<program>`, with `cmd.env` added to
+    /// the environment it inherits, and waits.
     fn run_process(
         &self,
-        program: &str,
-        args: Vec<String>,
+        cmd: ProcessCommand,
         cwd: Option<&Path>,
         stdin: Option<String>,
         cancel: &CancellationToken,
         timeout: Duration,
     ) -> Result<ProcessOutput, HostError>;
+    /// Starts the approved file of `process:<program>` without waiting; the
+    /// returned id names it in the calls below.
+    fn start_process(&self, cmd: ProcessCommand, cwd: Option<&Path>) -> Result<u64, HostError>;
+    /// What process `id` printed since the last call, each stream at most
+    /// `max` bytes (the rest stays queued), plus its status once it ended.
+    fn poll_process(&self, id: u64, max: usize) -> Result<ProcessChunk, HostError>;
+    /// Writes `text` to the stdin of process `id`.
+    fn write_process(&self, id: u64, text: &str) -> Result<(), HostError>;
+    /// Closes the stdin of process `id`.
+    fn close_process_stdin(&self, id: u64) -> Result<(), HostError>;
+    /// Ends process `id`; not an error if it already ended.
+    fn kill_process(&self, id: u64) -> Result<(), HostError>;
+    /// Waits up to `timeout` for process `id` to end (`ZERO` only checks),
+    /// returning what it printed meanwhile and its status once it ended.
+    fn wait_process(
+        &self,
+        id: u64,
+        max: usize,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<ProcessChunk, HostError>;
+    /// Forgets process `id`, killing it if it still runs.
+    fn release_process(&self, id: u64) -> Result<(), HostError>;
     fn subscribe(&self, kind: EventKind, on: bool);
     /// Starts a progress indicator; cancelling it from the UI cancels `cancel`.
     fn task_begin(&self, client: Option<&str>, title: String, cancellable: bool, cancel: CancellationToken) -> u64;

@@ -4,7 +4,10 @@
 
 use crate::runtime::{StoreData, clip};
 use crate::sandbox;
-use crate::types::{EditorContext, EventKind, HostError, HttpRequest, NotificationLevel, StatusItem, net_host};
+use crate::types::{
+    EditorContext, EventKind, HostError, HttpRequest, NotificationLevel, ProcessChunk, ProcessCommand, StatusItem,
+    net_host,
+};
 use ide_core::ipc_path::to_ipc;
 use ide_extension::Capability;
 use std::path::{Path, PathBuf};
@@ -136,6 +139,16 @@ const MAX_DIAGNOSTICS: usize = 5_000;
 const MAX_REQUEST_BODY: usize = 8 << 20;
 const MAX_FIND: u32 = 10_000;
 const MAX_STATUS_TEXT: usize = 128;
+/// Bounds of `process.command`: what a plugin may ask to run.
+const MAX_ARGS: usize = 256;
+const MAX_ARG_BYTES: usize = 4096;
+const MAX_ENV: usize = 64;
+const MAX_ENV_NAME: usize = 256;
+const MAX_ENV_VALUE: usize = 4096;
+/// Most output one `poll` / `wait` hands out, per stream.
+const MAX_CHUNK: usize = 1 << 20;
+/// Most text one `write` puts into a process's stdin.
+const MAX_STDIN_BYTES: usize = 1 << 20;
 
 type Fallible<T> = wasmtime::Result<Result<T, wit::Error>>;
 
@@ -570,6 +583,32 @@ impl StoreData {
     fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
+
+    /// Checks the `process:` grant and the shape of a [`process::Command`]: what
+    /// a plugin asks to run is bounded here, before anything is spawned.
+    fn command(
+        &self,
+        program: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> Result<ProcessCommand, wit::Error> {
+        self.require(Capability::Process(program.clone()))?;
+        if args.len() > MAX_ARGS || args.iter().any(|a| a.len() > MAX_ARG_BYTES) {
+            return Err(wit::Error::Invalid(format!("at most {MAX_ARGS} arguments of at most {MAX_ARG_BYTES} bytes")));
+        }
+        if env.len() > MAX_ENV {
+            return Err(wit::Error::Invalid(format!("at most {MAX_ENV} environment variables")));
+        }
+        for (name, value) in &env {
+            if name.is_empty() || name.len() > MAX_ENV_NAME || name.contains(['=', '\0']) {
+                return Err(wit::Error::Invalid(format!("{name:?} is not an environment variable name")));
+            }
+            if value.len() > MAX_ENV_VALUE || value.contains('\0') {
+                return Err(wit::Error::Invalid(format!("the value of {name:?} is too long or holds a NUL")));
+            }
+        }
+        Ok(ProcessCommand { program, args, env })
+    }
 }
 
 impl diagnostics::Host for StoreData {
@@ -656,6 +695,7 @@ impl process::Host for StoreData {
         if let Err(e) = self.require(Capability::Process(program.clone())) {
             return Ok(Err(e));
         }
+        let cmd = ProcessCommand { program, args, env: Vec::new() };
         let cwd = match &cwd {
             Some(p) => Some(self.table.get(p)?.root.clone()),
             None => None,
@@ -664,10 +704,84 @@ impl process::Host for StoreData {
         let timeout = self.remaining();
         Ok(self
             .host
-            .run_process(&program, args, cwd.as_deref(), stdin, &token, timeout)
+            .run_process(cmd, cwd.as_deref(), stdin, &token, timeout)
             .map(|o| process::Output { status: o.status, stdout: o.stdout, stderr: o.stderr })
             .map_err(to_wit))
     }
+
+    fn run_command(
+        &mut self,
+        cmd: process::Command,
+        cwd: Option<Resource<ProjectRes>>,
+        stdin: Option<String>,
+    ) -> Fallible<process::Output> {
+        let cmd = match self.command(cmd.program, cmd.args, cmd.env) {
+            Ok(cmd) => cmd,
+            Err(e) => return Ok(Err(e)),
+        };
+        let cwd = match &cwd {
+            Some(p) => Some(self.table.get(p)?.root.clone()),
+            None => None,
+        };
+        let token = self.cancel.token();
+        let timeout = self.remaining();
+        Ok(self
+            .host
+            .run_process(cmd, cwd.as_deref(), stdin, &token, timeout)
+            .map(|o| process::Output { status: o.status, stdout: o.stdout, stderr: o.stderr })
+            .map_err(to_wit))
+    }
+
+    fn start(&mut self, cmd: process::Command, cwd: Option<Resource<ProjectRes>>) -> Fallible<u64> {
+        let cmd = match self.command(cmd.program, cmd.args, cmd.env) {
+            Ok(cmd) => cmd,
+            Err(e) => return Ok(Err(e)),
+        };
+        let cwd = match &cwd {
+            Some(p) => Some(self.table.get(p)?.root.clone()),
+            None => None,
+        };
+        Ok(self.host.start_process(cmd, cwd.as_deref()).map_err(to_wit))
+    }
+
+    fn poll(&mut self, id: u64, max_bytes: u32) -> Fallible<process::Chunk> {
+        let max = chunk_bytes(max_bytes);
+        Ok(self.host.poll_process(id, max).map(to_chunk).map_err(to_wit))
+    }
+
+    fn write(&mut self, id: u64, text: String) -> Fallible<()> {
+        if text.len() > MAX_STDIN_BYTES {
+            return Ok(Err(wit::Error::Invalid(format!("writes are limited to {MAX_STDIN_BYTES} bytes"))));
+        }
+        Ok(self.host.write_process(id, &text).map_err(to_wit))
+    }
+
+    fn close_stdin(&mut self, id: u64) -> Fallible<()> {
+        Ok(self.host.close_process_stdin(id).map_err(to_wit))
+    }
+
+    fn kill(&mut self, id: u64) -> Fallible<()> {
+        Ok(self.host.kill_process(id).map_err(to_wit))
+    }
+
+    fn wait(&mut self, id: u64, timeout_ms: u32) -> Fallible<process::Chunk> {
+        let timeout = Duration::from_millis(u64::from(timeout_ms)).min(self.remaining());
+        let token = self.cancel.token();
+        Ok(self.host.wait_process(id, MAX_CHUNK, timeout, &token).map(to_chunk).map_err(to_wit))
+    }
+
+    fn release(&mut self, id: u64) -> Fallible<()> {
+        Ok(self.host.release_process(id).map_err(to_wit))
+    }
+}
+
+/// `max-bytes` of `poll`, bounded: the host never hands out more at once.
+fn chunk_bytes(max_bytes: u32) -> usize {
+    (max_bytes as usize).min(MAX_CHUNK)
+}
+
+fn to_chunk(c: ProcessChunk) -> process::Chunk {
+    process::Chunk { stdout: c.stdout, stderr: c.stderr, status: c.status }
 }
 
 impl views::Host for StoreData {

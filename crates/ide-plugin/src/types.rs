@@ -306,6 +306,24 @@ pub struct ProcessOutput {
     pub stderr: String,
 }
 
+/// What to run, and the variables to add on top of what the run inherits
+/// (WIT `process.command`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// What the process behind a handle printed since it was last read, and its
+/// exit status once it ended (WIT `process.chunk`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessChunk {
+    pub stdout: String,
+    pub stderr: String,
+    pub status: Option<i32>,
+}
+
 /// Where `net:` requests may go: the URL's host when it is `https`, or
 /// `http` to the loopback interface.
 pub fn net_host(url: &str) -> Result<String, String> {

@@ -5,8 +5,8 @@ wit_bindgen::generate!({
     inline: "
         package fixture:misbehave;
         world misbehave {
-            include openidea:plugin/plugin-syntax@1.6.0;
-            export openidea:plugin/providers@1.6.0;
+            include openidea:plugin/plugin-syntax@1.7.0;
+            export openidea:plugin/providers@1.7.0;
         }
     ",
     path: "../../../../../wit",
@@ -110,6 +110,38 @@ impl commands::Guest for Misbehave {
                     related: Vec::new(),
                 };
                 diagnostics::publish(&arg.unwrap_or_default(), &[d]).map(|()| None)
+            }
+            // A program kept running behind a handle: `git hash-object --stdin`
+            // reads what the plugin writes and prints a sha1 once stdin closes.
+            "child" => {
+                use openidea::plugin::process::{self, Command};
+                let cmd = Command {
+                    program: "git".into(),
+                    args: vec!["hash-object".into(), "--stdin".into()],
+                    env: Vec::new(),
+                };
+                let id = process::start(&cmd, None)?;
+                process::write(id, "hello\n")?;
+                process::close_stdin(id)?;
+                let chunk = process::wait(id, 30_000)?;
+                process::release(id)?;
+                Ok(Some(format!("{} {:?}", chunk.stdout.trim(), chunk.status)))
+            }
+            // A one-off run with extra environment: `git var` names the author it
+            // is told to, whatever this machine's git config says.
+            "envrun" => {
+                use openidea::plugin::process::{self, Command};
+                let cmd = Command {
+                    program: "git".into(),
+                    args: vec!["var".into(), "GIT_AUTHOR_IDENT".into()],
+                    env: vec![
+                        ("GIT_AUTHOR_NAME".into(), "Openidea Bot".into()),
+                        ("GIT_AUTHOR_EMAIL".into(), "bot@example.com".into()),
+                        ("GIT_AUTHOR_DATE".into(), "2005-04-07T22:13:13 +0200".into()),
+                    ],
+                };
+                let out = process::run_command(&cmd, None, None)?;
+                Ok(Some(out.stdout))
             }
             other => Err(types::Error::NotFound(format!("command {other}"))),
         }

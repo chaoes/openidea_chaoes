@@ -5,7 +5,7 @@
 //! editor with a versioned document, and enforces the capabilities you give
 //! it like the real host (a missing one returns [`Error::Denied`]).
 
-use crate::host::{DirEntry, Invocation, PathKind};
+use crate::host::{Chunk, Command, DirEntry, Invocation, PathKind};
 use crate::types::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,8 +37,28 @@ type ProcessHandler = Box<dyn Fn(&[String], Option<&str>) -> Result<ProcessOutpu
 pub struct ProcessRun {
     pub program: String,
     pub args: Vec<String>,
+    /// What the run added to its environment: empty for
+    /// [`run_process`](crate::host::run_process), the command's for
+    /// [`run_command`](crate::host::run_command).
+    pub env: Vec<(String, String)>,
     /// The project root it ran in (`None`: the data directory).
     pub cwd: Option<String>,
+}
+
+/// A program a plugin started and keeps running behind a handle.
+#[derive(Debug)]
+struct ChildState {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+    /// What `write` put into its stdin.
+    stdin: String,
+    stdin_closed: bool,
+    /// What it printed and the plugin has not read yet.
+    stdout: String,
+    stderr: String,
+    status: Option<i32>,
 }
 
 struct Editor {
@@ -80,6 +100,9 @@ struct State {
     requests: Vec<HttpRequest>,
     processes: BTreeMap<String, ProcessHandler>,
     runs: Vec<ProcessRun>,
+    /// The programs `start`ed, by handle id.
+    children: BTreeMap<u64, ChildState>,
+    next_child: u64,
     refreshed: Vec<String>,
     view_messages: Vec<(String, String)>,
     terminals: Vec<MockTerminal>,
@@ -103,6 +126,9 @@ thread_local! {
 pub struct MockHost {
     state: Rc<RefCell<State>>,
 }
+
+/// At most 8 programs a plugin may keep running, as the host allows.
+const MAX_CHILDREN: usize = 8;
 
 /// Every capability a plugin can hold, except `process:`/`net:`/`fs.read:`.
 const ALL: &[&str] = &[
@@ -302,6 +328,47 @@ impl MockHost {
 
     pub fn process_runs(&self) -> Vec<ProcessRun> {
         self.state.borrow().runs.clone()
+    }
+
+    /// What the program of the handle `id` prints next (nothing when the mock
+    /// no longer holds it).
+    pub fn push_child_output(&self, id: u64, text: &str) {
+        if let Some(child) = self.state.borrow_mut().children.get_mut(&id) {
+            child.stdout.push_str(text);
+        }
+    }
+
+    /// What the plugin wrote to the stdin of handle `id`.
+    pub fn child_stdin(&self, id: u64) -> String {
+        self.state.borrow().children.get(&id).map(|c| c.stdin.clone()).unwrap_or_default()
+    }
+
+    /// Whether the plugin closed the stdin of handle `id`.
+    pub fn child_stdin_closed(&self, id: u64) -> bool {
+        self.state.borrow().children.get(&id).is_some_and(|c| c.stdin_closed)
+    }
+
+    /// The exit status of handle `id`: `None` while it runs (or once the
+    /// handle is gone).
+    pub fn child_status(&self, id: u64) -> Option<i32> {
+        self.state.borrow().children.get(&id).and_then(|c| c.status)
+    }
+
+    /// The handles the plugin still holds, in the order it started them.
+    pub fn child_ids(&self) -> Vec<u64> {
+        self.state.borrow().children.keys().copied().collect()
+    }
+
+    /// The command the handle `id` runs, as the plugin started it.
+    pub fn child_command(&self, id: u64) -> Option<Command> {
+        let s = self.state.borrow();
+        let c = s.children.get(&id)?;
+        Some(Command::new(c.program.clone()).args(c.args.clone()).envs(c.env.clone()))
+    }
+
+    /// The project root the handle `id` runs in (`None`: the data directory).
+    pub fn child_cwd(&self, id: u64) -> Option<String> {
+        self.state.borrow().children.get(&id).and_then(|c| c.cwd.clone())
     }
 
     /// A context as `activate` receives it.
@@ -900,11 +967,151 @@ pub mod current {
     ) -> Result<ProcessOutput, Error> {
         with(|s| {
             require(s, &format!("process:{program}"))?;
-            s.runs.push(ProcessRun { program: program.into(), args: args.to_vec(), cwd: cwd.map(|p| p.root.clone()) });
+            s.runs.push(ProcessRun {
+                program: program.into(),
+                args: args.to_vec(),
+                env: Vec::new(),
+                cwd: cwd.map(|p| p.root.clone()),
+            });
             match s.processes.get(program) {
                 Some(handler) => handler(args, stdin),
                 None => Err(Error::NotFound(format!("{program} (MockHost::on_process)"))),
             }
+        })
+    }
+
+    /// Runs a [`Command`]: like `run_process`, with its environment in front of
+    /// what the program printed (the mock machine has none of its own, so this
+    /// is how a test sees the variables arrived).
+    pub fn run_command(cmd: &Command, cwd: Option<&ProjectRes>, stdin: Option<&str>) -> Result<ProcessOutput, Error> {
+        with(|s| {
+            require(s, &format!("process:{}", cmd.program()))?;
+            s.runs.push(ProcessRun {
+                program: cmd.program().into(),
+                args: cmd.arguments().to_vec(),
+                env: cmd.environment().to_vec(),
+                cwd: cwd.map(|p| p.root.clone()),
+            });
+            let Some(handler) = s.processes.get(cmd.program()) else {
+                return Err(Error::NotFound(format!("{} (MockHost::on_process)", cmd.program())));
+            };
+            let mut out = handler(cmd.arguments(), stdin)?;
+            let env: String = cmd.environment().iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+            out.stdout.insert_str(0, &env);
+            Ok(out)
+        })
+    }
+
+    /// Starts a [`Command`] and returns its handle, which the mock keeps until
+    /// it is released (the same 8-handle limit the host has).
+    pub fn start(cmd: &Command, cwd: Option<&ProjectRes>) -> Result<u64, Error> {
+        with(|s| {
+            require(s, &format!("process:{}", cmd.program()))?;
+            if s.children.len() >= MAX_CHILDREN {
+                return Err(Error::Invalid(format!(
+                    "{}: too many processes (at most {MAX_CHILDREN} at a time)",
+                    cmd.program()
+                )));
+            }
+            s.next_child += 1;
+            let id = s.next_child;
+            let child = ChildState {
+                program: cmd.program().into(),
+                args: cmd.arguments().to_vec(),
+                env: cmd.environment().to_vec(),
+                cwd: cwd.map(|p| p.root.clone()),
+                stdin: String::new(),
+                stdin_closed: false,
+                stdout: format!("started: {}\n", cmd.program()),
+                stderr: String::new(),
+                status: None,
+            };
+            s.children.insert(id, child);
+            Ok(id)
+        })
+    }
+
+    /// The handle `id`:`not found` once it was released.
+    fn child(s: &mut State, id: u64) -> Result<&mut ChildState, Error> {
+        s.children.get_mut(&id).ok_or_else(|| Error::NotFound(format!("{id} (no such process handle)")))
+    }
+
+    /// Up to `max` bytes from the front of `buf`, cut at a character
+    /// boundary; the rest stays for the next read.
+    fn take(buf: &mut String, max: u32) -> String {
+        let mut cut = (max as usize).min(buf.len());
+        while !buf.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        buf.drain(..cut).collect()
+    }
+
+    /// What the program of `id` printed since the last read, and its status.
+    pub fn child_poll(id: u64, max_bytes: u32) -> Result<Chunk, Error> {
+        with(|s| {
+            let c = child(s, id)?;
+            Ok(Chunk {
+                stdout: take(&mut c.stdout, max_bytes),
+                stderr: take(&mut c.stderr, max_bytes),
+                status: c.status,
+            })
+        })
+    }
+
+    /// Feeds `text` to the program of `id`; the mock program echoes it back.
+    pub fn child_write(id: u64, text: &str) -> Result<(), Error> {
+        with(|s| {
+            let c = child(s, id)?;
+            if c.status.is_some() {
+                return Err(Error::Invalid(format!("{id}: the process has ended")));
+            }
+            if c.stdin_closed {
+                return Err(Error::Invalid(format!("{id}: the input is closed")));
+            }
+            c.stdin.push_str(text);
+            c.stdout.push_str(&format!("echo: {text}"));
+            Ok(())
+        })
+    }
+
+    pub fn child_close_stdin(id: u64) -> Result<(), Error> {
+        with(|s| {
+            let c = child(s, id)?;
+            c.stdin_closed = true;
+            Ok(())
+        })
+    }
+
+    /// Ends the program of `id`, keeping the handle: `status` becomes -1, which
+    /// is what the host reports for a process a signal ended.
+    pub fn child_kill(id: u64) -> Result<(), Error> {
+        with(|s| {
+            let c = child(s, id)?;
+            if c.status.is_none() {
+                c.status = Some(-1);
+            }
+            Ok(())
+        })
+    }
+
+    /// Mock programs end at once, so this never waits: it reads what is left
+    /// and reports the status (`0` unless `kill` ended it).
+    pub fn child_wait(id: u64, _timeout_ms: u32) -> Result<Chunk, Error> {
+        with(|s| {
+            let c = child(s, id)?;
+            if c.status.is_none() {
+                c.status = Some(0);
+            }
+            Ok(Chunk { stdout: std::mem::take(&mut c.stdout), stderr: std::mem::take(&mut c.stderr), status: c.status })
+        })
+    }
+
+    /// Forgets the handle; releasing twice is fine, as `Child` does that when
+    /// it is dropped after an explicit `release`.
+    pub fn child_release(id: u64) -> Result<(), Error> {
+        with(|s| {
+            s.children.remove(&id);
+            Ok(())
         })
     }
 
@@ -943,6 +1150,7 @@ fn glob_match(glob: &str, path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::host;
+    use crate::host::Child;
 
     #[test]
     fn records_and_enforces() {
@@ -1210,5 +1418,107 @@ mod tests {
         assert!(matches!(host::fs_list("opt/seeyon/lib"), Err(Error::Invalid(_))));
         // A grant is a directory, not a string prefix.
         assert_eq!(host::fs_list("/opt/seeyonx/lib"), Err(Error::Denied("fs.read:/opt/seeyonx/lib".into())));
+    }
+
+    #[test]
+    fn run_command_passes_environment_variables() {
+        let mock = MockHost::install().with_capabilities(&["process:java"]);
+        mock.on_process("java", |args, stdin| {
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout: format!("{}|{}", args.join(" "), stdin.unwrap_or("")),
+                stderr: String::new(),
+            })
+        });
+        let cmd = Command::new("java")
+            .args(["-jar", "build/harness.jar"])
+            .env("LANG", "en_US.UTF-8")
+            .envs([("CLASSPATH", "lib/*")]);
+
+        let out = host::run_command(&cmd, None, Some("-version\n")).unwrap();
+        // The mock machine has no environment, so the variables it was given
+        // show up in front of what the program printed, in the order added.
+        assert_eq!(out.stdout, "LANG=en_US.UTF-8\nCLASSPATH=lib/*\n-jar build/harness.jar|-version\n");
+        assert_eq!(out.status, Some(0));
+
+        let run = &mock.process_runs()[0];
+        assert_eq!(run.program, "java");
+        assert_eq!(run.args, vec!["-jar".to_string(), "build/harness.jar".to_string()]);
+        assert_eq!(
+            run.env,
+            vec![("LANG".to_string(), "en_US.UTF-8".to_string()), ("CLASSPATH".to_string(), "lib/*".to_string())]
+        );
+        assert_eq!(run.cwd, None);
+    }
+
+    #[test]
+    fn start_needs_its_own_grant() {
+        let _mock = MockHost::install();
+        assert_eq!(host::start(&Command::new("java"), None).map(|c| c.id()), Err(Error::Denied("process:java".into())));
+
+        let mock = MockHost::install().with_capabilities(&["process:java"]);
+        let child = host::start(&Command::new("java").env("LANG", "C"), None).unwrap();
+        assert_eq!(child.id(), 1);
+        assert_eq!(mock.child_ids(), vec![1]);
+        assert_eq!(mock.child_command(1).unwrap(), Command::new("java").env("LANG", "C"));
+        assert_eq!(mock.child_cwd(1), None);
+    }
+
+    #[test]
+    fn a_child_writes_and_reads_back_its_output() {
+        let mock = MockHost::install().with_capabilities(&["process:java"]);
+        let child = host::start(&Command::new("java").args(["-jar", "app.jar"]), None).unwrap();
+        assert_eq!(
+            child.poll(1024).unwrap(),
+            Chunk { stdout: "started: java\n".into(), stderr: String::new(), status: None }
+        );
+
+        child.write("hello\n").unwrap();
+        assert_eq!(mock.child_stdin(child.id()), "hello\n");
+        // `max_bytes` cuts the read short; the rest waits for the next call.
+        assert_eq!(child.poll(6).unwrap().stdout, "echo: ");
+        assert_eq!(child.poll(1024).unwrap().stdout, "hello\n");
+
+        child.close_stdin().unwrap();
+        assert!(mock.child_stdin_closed(child.id()));
+        assert_eq!(child.write("more\n"), Err(Error::Invalid("1: the input is closed".into())));
+
+        let end = child.wait(1000).unwrap();
+        assert_eq!(end.stdout, "");
+        assert_eq!(end.status, Some(0));
+
+        child.release().unwrap();
+        assert!(mock.child_ids().is_empty());
+    }
+
+    #[test]
+    fn kill_ends_a_child_and_keeps_its_status() {
+        let mock = MockHost::install().with_capabilities(&["process:java"]);
+        let child = host::start(&Command::new("java"), None).unwrap();
+        mock.push_child_output(child.id(), "warning: deprecated\n");
+
+        child.kill().unwrap();
+        assert_eq!(mock.child_status(child.id()), Some(-1));
+        let end = child.wait(0).unwrap();
+        assert_eq!(end.stdout, "started: java\nwarning: deprecated\n");
+        assert_eq!(end.status, Some(-1));
+
+        assert_eq!(child.write("too late\n"), Err(Error::Invalid("1: the process has ended".into())));
+        assert_eq!(child.poll(1024).unwrap().status, Some(-1));
+    }
+
+    #[test]
+    fn the_ninth_child_is_refused() {
+        let mock = MockHost::install().with_capabilities(&["process:java"]);
+        let mut held: Vec<Child> = (0..8).map(|_| host::start(&Command::new("java"), None).unwrap()).collect();
+        assert_eq!(mock.child_ids(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(matches!(
+            host::start(&Command::new("java"), None),
+            Err(Error::Invalid(msg)) if msg.contains("too many processes")
+        ));
+
+        // Releasing one makes room for the next.
+        held.remove(0).release().unwrap();
+        assert_eq!(host::start(&Command::new("java"), None).unwrap().id(), 9);
     }
 }
