@@ -130,6 +130,23 @@ mod imp {
         })
     }
 
+    pub fn fs_list(path: &str) -> Result<Vec<super::DirEntry>, Error> {
+        use super::{DirEntry, PathKind};
+        let mut entries: Vec<DirEntry> = wit::fs::read_dir(path)
+            .map_err(error)?
+            .into_iter()
+            .map(|e| DirEntry {
+                name: e.name,
+                kind: match e.kind {
+                    wit::fs::FileKind::File => PathKind::File,
+                    wit::fs::FileKind::Directory => PathKind::Directory,
+                },
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
     pub fn fs_write_text(path: &str, text: &str) -> Result<(), Error> {
         wit::fs::write_text(path, text).map_err(error)
     }
@@ -526,6 +543,27 @@ pub fn fs_read_bytes(path: &str) -> Result<Vec<u8>, Error> {
 /// `fs.read:<path>`.
 pub fn fs_path_kind(path: &str) -> Result<PathKind, Error> {
     imp::fs_path_kind(path)
+}
+
+/// A direct child of a directory listed by [`fs_list`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    /// The name of the entry alone, without its directory.
+    pub name: String,
+    /// Whether the entry is a file or a directory.
+    pub kind: PathKind,
+}
+
+/// The entries directly under a directory outside the project (the jars of a
+/// library directory, say), sorted by name; at most 4096 of them. Subdirectories
+/// are not walked — list them one by one. `path` is absolute, or starts with
+/// `~/` for the user's home.
+///
+/// Needs an `fs.read:<path>` grant covering the directory; without one this
+/// returns [`Error::Denied`] naming the real path the manifest has to declare.
+/// A file instead of a directory is [`Error::Invalid`].
+pub fn fs_list(path: &str) -> Result<Vec<DirEntry>, Error> {
+    imp::fs_list(path)
 }
 
 /// Replaces a text file outside the project, creating it when it is not there,

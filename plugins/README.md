@@ -194,23 +194,23 @@ installing (or when a new version asks for more). Low-risk capabilities are
 listed; high-risk ones are called out as equivalent to running code on the
 machine. Users can revoke optional capabilities in Settings › Plugins.
 
-| Capability          | Risk   | Unlocks today                                                                       |
-| ------------------- | ------ | ----------------------------------------------------------------------------------- |
-| `project.read`      | low    | `Project::root`, `read_file`, `find_files`, `host::projects`, `publish_diagnostics` |
-| `project.write`     | medium | `Project::write_file`: create and replace files inside the project root             |
-| `editor.read`       | low    | `TextEditor::document`, `selections`                                                |
-| `editor.write`      | medium | `TextEditor::apply_edits`                                                           |
-| `vcs.read`          | low    | `Project::vcs_status` (branch, upstream, ahead/behind, changes), `vcs_remotes`      |
-| `vcs.write`         | medium | `Project::vcs_fetch` (trusted projects only)                                        |
-| `storage`           | low    | `host::storage` (1 MiB per plugin)                                                  |
-| `events`            | low    | file opened/saved, editor focused, repository changed events                        |
-| `events.input`      | medium | `action-performed` events (which actions you run, and how)                          |
-| `fs.read:<path>`    | high   | `host::fs_read_text`, `fs_read_bytes`, `fs_path_kind` for files under that path     |
-| `fs.write:<path>`   | high   | `host::fs_write_text`, `fs_write_bytes` for files under that path                   |
-| `process:<program>` | high   | `Project::run_process`, language servers, debug adapters, runs                      |
-| `net:<host>`        | medium | `host::fetch` to that host (`*.example.com`: its subdomains)                        |
-| `secrets`           | medium | `{{secret:<name>}}` in request headers, `host::secret_is_set`                       |
-| `clipboard`         | medium | `host::copy_to_clipboard` and the clipboard API in the plugin's web views           |
+| Capability          | Risk   | Unlocks today                                                                              |
+| ------------------- | ------ | ------------------------------------------------------------------------------------------ |
+| `project.read`      | low    | `Project::root`, `read_file`, `find_files`, `host::projects`, `publish_diagnostics`        |
+| `project.write`     | medium | `Project::write_file`: create and replace files inside the project root                    |
+| `editor.read`       | low    | `TextEditor::document`, `selections`                                                       |
+| `editor.write`      | medium | `TextEditor::apply_edits`                                                                  |
+| `vcs.read`          | low    | `Project::vcs_status` (branch, upstream, ahead/behind, changes), `vcs_remotes`             |
+| `vcs.write`         | medium | `Project::vcs_fetch` (trusted projects only)                                               |
+| `storage`           | low    | `host::storage` (1 MiB per plugin)                                                         |
+| `events`            | low    | file opened/saved, editor focused, repository changed events                               |
+| `events.input`      | medium | `action-performed` events (which actions you run, and how)                                 |
+| `fs.read:<path>`    | high   | `host::fs_read_text`, `fs_read_bytes`, `fs_path_kind`, `fs_list` for files under that path |
+| `fs.write:<path>`   | high   | `host::fs_write_text`, `fs_write_bytes` for files under that path                          |
+| `process:<program>` | high   | `Project::run_process`, language servers, debug adapters, runs                             |
+| `net:<host>`        | medium | `host::fetch` to that host (`*.example.com`: its subdomains)                               |
+| `secrets`           | medium | `{{secret:<name>}}` in request headers, `host::secret_is_set`                              |
+| `clipboard`         | medium | `host::copy_to_clipboard` and the clipboard API in the plugin's web views                  |
 
 `process:` capabilities are also derived from what the contributions start: a
 language's `language-servers` and `debugger` commands and a run detector's

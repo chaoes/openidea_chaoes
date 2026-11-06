@@ -490,6 +490,36 @@ fn fs_write_reaches_only_the_granted_paths() {
     assert_eq!((info.status, info.stats.crashes, info.stats.errors), (PluginStatus::Active, 0, 0), "{info:?}");
 }
 
+/// `fs.read` also lists a directory the grant covers — sorted, directories
+/// marked — and nothing else, through the real component.
+#[test]
+fn fs_list_reads_only_a_granted_directory() {
+    let f = fixture(Limits::default());
+    let shared = f._tmp.path().join("shared");
+    std::fs::create_dir_all(shared.join("sub")).unwrap();
+    std::fs::write(shared.join("b.txt"), "b\n").unwrap();
+    std::fs::write(shared.join("a.txt"), "a\n").unwrap();
+    let sibling = f._tmp.path().join("shared-other");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let secret = f._tmp.path().join("secret.txt");
+    std::fs::write(&secret, "keep me\n").unwrap();
+    f.install(&misbehave_granted(f._tmp.path(), &shared));
+
+    // Sorted by name, a directory marked with a trailing slash.
+    assert_eq!(f.run("misbehave", "fslist", Some(shared.to_str().unwrap())).unwrap().unwrap(), "a.txt\nb.txt\nsub/\n");
+    let err = f.run("misbehave", "fslist", Some(secret.to_str().unwrap())).unwrap_err();
+    assert!(err.contains("fs.read:"), "the refusal names what to grant: {err}");
+    let err = f.run("misbehave", "fslist", Some(sibling.to_str().unwrap())).unwrap_err();
+    assert!(err.contains("fs.read:"), "a name prefix grants nothing: {err}");
+    let err = f.run("misbehave", "fslist", Some(shared.join("a.txt").to_str().unwrap())).unwrap_err();
+    assert!(err.contains("not a directory"), "{err}");
+    let err = f.run("misbehave", "fslist", Some(shared.join("gone").to_str().unwrap())).unwrap_err();
+    assert!(err.contains("no such file"), "{err}");
+    // A refusal is the plugin's to handle, like any other error it gets.
+    let info = f.host.info_of("misbehave").unwrap();
+    assert_eq!((info.status, info.stats.crashes, info.stats.errors), (PluginStatus::Active, 0, 0), "{info:?}");
+}
+
 /// `project.write` creates and replaces files under the project root, and never
 /// leaves it, through the real component.
 #[test]
@@ -809,7 +839,7 @@ fn idle_instances_are_reclaimed_and_schedules_reactivate() {
     assert_eq!(f.host.instances(), 0);
     let info = f.host.info_of("misbehave").unwrap();
     assert_eq!((info.status, info.stats.reclaims), (PluginStatus::Inactive, 1));
-    assert_eq!(f.command_titles("misbehave").len(), 13, "contributions stay");
+    assert_eq!(f.command_titles("misbehave").len(), 14, "contributions stay");
     assert_eq!(f.run("misbehave", "echo", Some("y")).unwrap().as_deref(), Some("y"));
     assert_eq!(f.host.info_of("misbehave").unwrap().stats.activations, 2);
 

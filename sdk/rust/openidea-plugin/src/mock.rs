@@ -5,7 +5,7 @@
 //! editor with a versioned document, and enforces the capabilities you give
 //! it like the real host (a missing one returns [`Error::Denied`]).
 
-use crate::host::{Invocation, PathKind};
+use crate::host::{DirEntry, Invocation, PathKind};
 use crate::types::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -631,6 +631,40 @@ pub mod current {
         })
     }
 
+    pub fn fs_list(path: &str) -> Result<Vec<DirEntry>, Error> {
+        with(|s| {
+            check_external(s, "fs.read", path)?;
+            if s.external.contains_key(path) || s.external_bytes.contains_key(path) {
+                return Err(Error::Invalid(format!("{path}: not a directory")));
+            }
+            // The mock has no directory table: a directory is whatever the
+            // registered files spell out, so a name under `path` is a file when
+            // the whole rest is one segment and a directory when it goes deeper.
+            let dir = path.trim_end_matches(['/', '\\']);
+            let mut names: BTreeMap<String, PathKind> = BTreeMap::new();
+            for key in s.external.keys().chain(s.external_bytes.keys()) {
+                let Some(rest) = key.strip_prefix(dir) else { continue };
+                if !(rest.starts_with('/') || rest.starts_with('\\')) {
+                    continue;
+                }
+                let rest = &rest[1..];
+                let (name, kind) = match rest.find(['/', '\\']) {
+                    Some(cut) => (&rest[..cut], PathKind::Directory),
+                    None => (rest, PathKind::File),
+                };
+                let entry = names.entry(name.to_owned()).or_insert(kind);
+                // A directory named like a file wins: the real host cannot hold both.
+                if kind == PathKind::Directory {
+                    *entry = PathKind::Directory;
+                }
+            }
+            if names.is_empty() && !dir_exists(s, dir) {
+                return Err(Error::Invalid(format!("{path}: no such directory")));
+            }
+            Ok(names.into_iter().map(|(name, kind)| DirEntry { name, kind }).collect())
+        })
+    }
+
     pub fn fs_write_text(path: &str, text: &str) -> Result<(), Error> {
         with(|s| {
             check_writable(s, path)?;
@@ -1124,5 +1158,57 @@ mod tests {
         mock.open_editor("/project/src/a.txt", "text", "hello edited", &[]);
         assert!(matches!(project.write_file("src/a.txt", b"bye"), Err(Error::Invalid(_))));
         assert_eq!(project.read_file("src/a.txt").unwrap(), "hello edited");
+    }
+
+    #[test]
+    fn fs_list_lists_files_and_directories_under_a_granted_path() {
+        let mock = MockHost::install();
+        mock.add_external_file("/opt/seeyon/lib/spring.jar", "jar");
+        assert_eq!(host::fs_list("/opt/seeyon/lib"), Err(Error::Denied("fs.read:/opt/seeyon/lib".into())));
+
+        let mock = MockHost::install().with_capabilities(&["fs.read:/opt/seeyon", "fs.write:/opt/seeyon"]);
+        mock.add_external_file("/opt/seeyon/lib/spring.jar", "jar");
+        mock.add_external_file("/opt/seeyon/lib/axis.jar", "jar");
+        mock.add_external_file("/opt/seeyon/lib/conf/app.properties", "name=YonBIP\n");
+        mock.add_external_file("/opt/seeyon/other.txt", "x");
+        // Directories in between the registered files are entries of their own,
+        // and the whole list is sorted by name.
+        assert_eq!(
+            host::fs_list("/opt/seeyon/lib").unwrap(),
+            vec![
+                DirEntry { name: "axis.jar".into(), kind: PathKind::File },
+                DirEntry { name: "conf".into(), kind: PathKind::Directory },
+                DirEntry { name: "spring.jar".into(), kind: PathKind::File },
+            ]
+        );
+        assert_eq!(host::fs_list("/opt/seeyon/lib/").unwrap().len(), 3);
+        assert_eq!(
+            host::fs_list("/opt/seeyon").unwrap(),
+            vec![
+                DirEntry { name: "lib".into(), kind: PathKind::Directory },
+                DirEntry { name: "other.txt".into(), kind: PathKind::File },
+            ]
+        );
+        // Bytes the plugin wrote through `fs` are listed like the rest.
+        host::fs_write_bytes("/opt/seeyon/lib/gson.jar", &[0xff, 0x01]).unwrap();
+        assert!(
+            host::fs_list("/opt/seeyon/lib")
+                .unwrap()
+                .contains(&DirEntry { name: "gson.jar".into(), kind: PathKind::File })
+        );
+
+        // A file is not a directory, a missing one is an error, and relative
+        // paths are path errors before the grant.
+        assert_eq!(
+            host::fs_list("/opt/seeyon/other.txt"),
+            Err(Error::Invalid("/opt/seeyon/other.txt: not a directory".into()))
+        );
+        assert_eq!(
+            host::fs_list("/opt/seeyon/nope"),
+            Err(Error::Invalid("/opt/seeyon/nope: no such directory".into()))
+        );
+        assert!(matches!(host::fs_list("opt/seeyon/lib"), Err(Error::Invalid(_))));
+        // A grant is a directory, not a string prefix.
+        assert_eq!(host::fs_list("/opt/seeyonx/lib"), Err(Error::Denied("fs.read:/opt/seeyonx/lib".into())));
     }
 }

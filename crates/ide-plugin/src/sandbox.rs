@@ -9,6 +9,9 @@ pub const MAX_READ_BYTES: u64 = 16 << 20;
 /// Largest file one `fs.write-*` call may replace.
 pub const MAX_WRITE_BYTES: usize = 16 << 20;
 
+/// Most entries one `fs.list` call returns.
+pub const MAX_LIST_ENTRIES: usize = 4096;
+
 /// Resolves `path` (absolute, or relative to `root`) and checks that the real
 /// path — after following `..` and symlinks — stays inside `root`.
 pub fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf, String> {
