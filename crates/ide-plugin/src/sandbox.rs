@@ -156,11 +156,15 @@ fn resolve(granted: &[Capability], path: &str, wanted: Wanted) -> Result<PathBuf
             (Wanted::Read, Capability::FsRead(base)) | (Wanted::Write, Capability::FsWrite(base)) => base,
             _ => continue,
         };
+        // A manifest may declare `fs.read:~`, which names the user's home; the
+        // granted base has to be expanded the way the asked path was.
+        let base = strip_verbatim(&expand_tilde(base));
+        let grant = wanted.capability(base.clone());
         if !grant.covers(&cap) {
             continue;
         }
         // A directory that is its own parent is a root: `/`, `C:\`.
-        if Path::new(base).parent().is_none() {
+        if Path::new(&base).parent().is_none() {
             return Err(Refusal::Invalid(format!(
                 "{plain}: {}:{base} covers a whole file system; declare a directory",
                 wanted.prefix()
@@ -339,6 +343,26 @@ mod tests {
             PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap())
         );
         assert_eq!(expand_tilde("relative/x"), PathBuf::from("relative/x"));
+    }
+
+    #[test]
+    fn a_tilde_grant_covers_the_users_home() {
+        // `fs.read:~` is compared against the asked path's expanded form, so the
+        // home directory itself has to resolve rather than be denied.
+        if std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).is_none() {
+            return;
+        }
+        let grant = Capability::FsRead("~".into());
+        let home = resolve_granted(std::slice::from_ref(&grant), "~").unwrap();
+        assert!(home.is_dir(), "{}", home.display());
+
+        let outside = tempfile::tempdir().unwrap();
+        if outside.path().canonicalize().unwrap().starts_with(&home) {
+            // `%TEMP%` lives under the home on Windows; nothing outside to ask for.
+            return;
+        }
+        let err = resolve_granted(std::slice::from_ref(&grant), outside.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, Refusal::Denied(_)), "{err:?}");
     }
 
     /// The write grant a manifest author would write for `dir`.
