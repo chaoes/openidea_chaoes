@@ -90,6 +90,7 @@ describe("Java debugging (java-debug through jdtls)", () => {
       args: '--port "8081 x"',
       console: "internalConsole",
       shortenCommandLine: "none",
+      projectName: "p",
     });
   });
 
@@ -162,7 +163,12 @@ describe("Java debugging (java-debug through jdtls)", () => {
   it("attaches to a JDWP agent", async () => {
     const l = await javaAttachConfig({ name: "mvn test", module: "", hostName: "127.0.0.1", port: 5005 }, "/p");
     expect(l).toMatchObject({ request: "attach", cwd: "/p" });
-    expect(JSON.parse(l.extraJson!)).toMatchObject({ debugServer: 41234, hostName: "127.0.0.1", port: 5005 });
+    expect(JSON.parse(l.extraJson!)).toMatchObject({
+      debugServer: 41234,
+      hostName: "127.0.0.1",
+      port: 5005,
+      projectName: "p",
+    });
   });
 });
 

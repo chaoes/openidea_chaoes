@@ -30,6 +30,13 @@ function join(base: string, p: string) {
   return rel === "." || rel === "" ? base : `${base.replace(/\/$/, "")}/${rel}`;
 }
 
+/** Last path segment: jdtls names a Java project after the folder it imported. */
+function baseName(p: string): string {
+  const s = p.replace(/[\\/]+$/, "");
+  const cut = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return cut >= 0 ? s.slice(cut + 1) : s;
+}
+
 /** Conventional JVM source sets, including Kotlin kept in a Java source directory.
  * A mixed module uses Kotlin's adapter, which also accepts Java line breakpoints.
  */
@@ -125,6 +132,10 @@ export async function javaLaunchConfig(
   }
   const port = await debugServer(module, preparation?.signal);
   preparation?.signal.throwIfAborted();
+  // java-debug resolves the Java project for Evaluate on its own from `mainClass` only when
+  // the class belongs to a project it knows; name the project it imported so that works for
+  // classes compiled outside the language server's build (plain folders, custom outputs).
+  const projectName = baseName(info.projectRoot ?? root);
   return {
     name: rc.name,
     adapter: JAVA_ADAPTER,
@@ -139,6 +150,7 @@ export async function javaLaunchConfig(
       mainClass: parsed.mainClass,
       classPaths,
       modulePaths: info.modulePaths,
+      projectName,
       javaExec: resolved.command === "java" ? undefined : resolved.command,
       vmArgs: joinJavaArgs([...consoleVmArgs(rc), ...parsed.vmArgs]),
       args: joinJavaArgs(parsed.programArgs),
@@ -180,6 +192,10 @@ export async function javaAttachConfig(target: JavaAttachTarget, root: string): 
     };
   }
   const port = await debugServer(target.module);
+  // java-debug resolves the Java project for Evaluate from `mainClass` only when the class is in
+  // a project it imported; a JDWP attach cannot even see the main class, so name the project the
+  // language server imported (the directory name of the module it opened).
+  const projectName = baseName(cwd);
   return {
     name: target.name,
     adapter: JAVA_ADAPTER,
@@ -188,6 +204,12 @@ export async function javaAttachConfig(target: JavaAttachTarget, root: string): 
     args: [],
     cwd: target.module ? join(root, target.module) : root,
     env: {},
-    extraJson: JSON.stringify({ debugServer: port, hostName: target.hostName, port: target.port, timeout: 30_000 }),
+    extraJson: JSON.stringify({
+      debugServer: port,
+      hostName: target.hostName,
+      port: target.port,
+      timeout: 30_000,
+      projectName,
+    }),
   };
 }
