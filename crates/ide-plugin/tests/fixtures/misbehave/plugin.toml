@@ -42,6 +42,10 @@ id = "fswrite"
 title = "fswrite"
 
 [[contributes.commands]]
+id = "projwrite"
+title = "projwrite"
+
+[[contributes.commands]]
 id = "insert"
 title = "insert"
 

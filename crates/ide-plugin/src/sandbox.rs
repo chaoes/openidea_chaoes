@@ -25,6 +25,29 @@ pub fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(real)
 }
 
+/// Resolves the file `path` names inside `root` for writing, creating the
+/// directories it needs: `path` may not exist yet, so the deepest part that
+/// exists is canonicalized (following symlinks) and must stay inside `root`.
+pub fn resolve_writable_in_root(root: &Path, path: &str) -> Result<PathBuf, String> {
+    if path.is_empty() {
+        return Err("empty path".into());
+    }
+    let root = root.canonicalize().map_err(|e| format!("project root unavailable: {e}"))?;
+    let requested = Path::new(path);
+    let joined = if requested.is_absolute() { requested.to_path_buf() } else { root.join(requested) };
+    let mut existing = joined.as_path();
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| format!("{path}: no such directory"))?;
+    }
+    let real = existing.canonicalize().map_err(|_| format!("{path}: no such directory"))?;
+    if !real.starts_with(&root) {
+        return Err(format!("{path}: access outside the project root is not allowed"));
+    }
+    let rest = joined.strip_prefix(existing).unwrap_or(Path::new(""));
+    // `join("")` would add a trailing separator, which names no file on Windows.
+    Ok(if rest.as_os_str().is_empty() { real } else { real.join(rest) })
+}
+
 /// Reads a UTF-8 file that `resolve_in_root` already approved.
 pub fn read_text(real: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(real).map_err(|e| e.to_string())?;
@@ -393,5 +416,48 @@ mod tests {
         let cap = Capability::FsWrite("/".into());
         let err = resolve_writable(&[cap], target.to_str().unwrap()).unwrap_err();
         assert!(matches!(err, Refusal::Invalid(ref m) if m.contains("whole file system")), "{err:?}");
+    }
+
+    #[test]
+    fn a_project_write_may_create_files_under_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // Neither the file nor its directory exists yet.
+        let real = resolve_writable_in_root(&root, ".openidea/run.toml").unwrap();
+        assert_eq!(real, root.join(".openidea").join("run.toml"));
+        // An absolute path inside the root works too, and reads as the same file.
+        let abs = root.join("notes.txt");
+        assert_eq!(resolve_writable_in_root(&root, abs.to_str().unwrap()).unwrap(), abs);
+    }
+
+    #[test]
+    fn a_project_write_cannot_leave_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        for path in ["../outside.txt", "src/../../outside.txt"] {
+            let err = resolve_writable_in_root(&root, path).unwrap_err();
+            assert!(err.contains("outside the project root"), "{path}: {err}");
+        }
+        // The root itself is not a file to write.
+        assert!(resolve_writable_in_root(&root, "..").is_err());
+    }
+
+    #[test]
+    fn a_project_write_through_a_symlink_stays_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let root = root.canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+            let err = resolve_writable_in_root(&root, "link/escape.txt").unwrap_err();
+            assert!(err.contains("outside the project root"), "{err}");
+        }
+        #[cfg(windows)]
+        let _ = (root, outside);
     }
 }

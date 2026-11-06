@@ -798,6 +798,19 @@ impl HostApi for PluginApi {
         ide_vfs::write_atomic(real, bytes).map_err(|e| not_writable(real, e))?;
         Ok(())
     }
+
+    fn write_project_file(&self, real: &Path, bytes: &[u8], max: usize) -> Result<(), HostError> {
+        if bytes.len() > max {
+            return Err(too_much_to_write(real, max));
+        }
+        // A Run configuration lives in `.openidea/`, which may not exist yet.
+        if let Some(parent) = real.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| HostError::Failed(format!("{}: {e}", parent.display())))?;
+        }
+        check_unsaved(self.shared.workspace(), real)?;
+        ide_vfs::write_atomic(real, bytes).map_err(|e| not_writable(real, e))?;
+        Ok(())
+    }
 }
 
 /// A file that is not there, or cannot be read, as the plugin sees it.

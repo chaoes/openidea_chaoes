@@ -353,6 +353,18 @@ impl workspace::HostProject for StoreData {
         Ok(self.host.find_files(&root, &glob, limit.min(MAX_FIND) as usize).map_err(to_wit))
     }
 
+    fn write_file(&mut self, this: Resource<ProjectRes>, path: String, bytes: Vec<u8>) -> Fallible<()> {
+        if let Err(e) = self.require(Capability::ProjectWrite) {
+            return Ok(Err(e));
+        }
+        let root = self.table.get(&this)?.root.clone();
+        let real = match sandbox::resolve_writable_in_root(&root, &path) {
+            Ok(real) => real,
+            Err(e) => return Ok(Err(wit::Error::Invalid(e))),
+        };
+        Ok(self.host.write_project_file(&real, &bytes, sandbox::MAX_WRITE_BYTES).map_err(to_wit))
+    }
+
     fn drop(&mut self, rep: Resource<ProjectRes>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())

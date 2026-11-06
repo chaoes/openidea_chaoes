@@ -55,6 +55,8 @@ struct State {
     root: Option<String>,
     other_projects: Vec<String>,
     files: BTreeMap<String, String>,
+    /// What `project_write` put there, when the bytes are not UTF-8 text.
+    file_bytes: BTreeMap<String, Vec<u8>>,
     /// Files outside every project, for `fs` (absolute paths).
     external: BTreeMap<String, String>,
     /// The same, for what `fs_write_bytes` put there.
@@ -536,19 +538,56 @@ pub mod current {
         })
     }
 
+    /// The file table key `path` names inside `p`, refusing anything outside the root.
+    fn project_rel(p: &ProjectRes, path: &str) -> Result<String, Error> {
+        let rel = path.strip_prefix(p.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path);
+        if rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
+            return Err(Error::Invalid(format!("{path}: access outside the project root is not allowed")));
+        }
+        Ok(rel.to_owned())
+    }
+
     pub fn project_read(p: &ProjectRes, path: &str) -> Result<String, Error> {
         with(|s| {
             require(s, "project.read")?;
             let root = p.root.as_str();
-            let rel = path.strip_prefix(root).map(|p| p.trim_start_matches('/')).unwrap_or(path);
-            if rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
-                return Err(Error::Invalid(format!("{path}: access outside the project root is not allowed")));
-            }
+            let rel = project_rel(p, path)?;
             let open = s.editor.as_ref().filter(|e| e.path == path || e.path == format!("{root}/{rel}"));
             if let Some(e) = open {
                 return Ok(e.text.clone());
             }
-            s.files.get(rel).or_else(|| s.files.get(path)).cloned().ok_or_else(|| Error::NotFound(path.into()))
+            let key = |map: &BTreeMap<String, String>| map.get(&rel).or_else(|| map.get(path)).cloned();
+            if let Some(text) = key(&s.files) {
+                return Ok(text);
+            }
+            if let Some(bytes) = s.file_bytes.get(&rel).or_else(|| s.file_bytes.get(path)) {
+                return String::from_utf8(bytes.clone())
+                    .map_err(|_| Error::Invalid(format!("{path}: not valid UTF-8 text")));
+            }
+            Err(Error::NotFound(path.into()))
+        })
+    }
+
+    pub fn project_write(p: &ProjectRes, path: &str, bytes: &[u8]) -> Result<(), Error> {
+        with(|s| {
+            let rel = project_rel(p, path)?;
+            require(s, "project.write")?;
+            // Missing parent directories are implicit: a key creates them.
+            let unsaved = |e: &Editor| e.path == path || e.path == format!("{}/{rel}", p.root);
+            if s.editor.as_ref().is_some_and(unsaved) {
+                return Err(Error::Invalid(format!("{path}: the file has unsaved changes")));
+            }
+            match String::from_utf8(bytes.to_vec()) {
+                Ok(text) => {
+                    s.file_bytes.remove(&rel);
+                    s.files.insert(rel, text);
+                }
+                Err(_) => {
+                    s.files.remove(&rel);
+                    s.file_bytes.insert(rel, bytes.to_vec());
+                }
+            }
+            Ok(())
         })
     }
 
@@ -1027,5 +1066,63 @@ mod tests {
         assert!(matches!(host::fs_write_text("opt/seeyon/app.properties", "x"), Err(Error::Invalid(_))));
         assert!(matches!(host::fs_write_text("/opt/seeyon/conf", "x"), Err(Error::Invalid(_))));
         assert!(matches!(host::fs_write_bytes("/opt/seeyon/no/dir/x.bin", &[1]), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn project_write_needs_its_own_grant() {
+        // `project.read` does not let a plugin write.
+        let mock = MockHost::install().with_capabilities(&["project.read"]);
+        mock.add_file("src/a.txt", "hello");
+        let project = mock.invocation().project().unwrap();
+        assert_eq!(project.write_file("/project/src/a.txt", b"bye"), Err(Error::Denied("project.write".into())));
+        assert_eq!(project.read_file("src/a.txt").unwrap(), "hello");
+
+        // Nor does `project.write` imply reading.
+        let mock = MockHost::install().with_capabilities(&["project.write"]);
+        mock.add_file("src/a.txt", "hello");
+        let project = mock.invocation().project().unwrap();
+        project.write_file("src/a.txt", b"bye").unwrap();
+        assert_eq!(project.read_file("src/a.txt"), Err(Error::Denied("project.read".into())));
+    }
+
+    #[test]
+    fn project_write_creates_parents_and_replaces_contents() {
+        let mock = MockHost::install().with_capabilities(&["project.read", "project.write"]);
+        mock.add_file("src/a.txt", "hello");
+        let project = mock.invocation().project().unwrap();
+
+        // Missing parent directories are created.
+        project.write_file("/project/.openidea/run.toml", b"[run]\nmain = \"com.seeyon.App\"\n").unwrap();
+        assert_eq!(project.read_file(".openidea/run.toml").unwrap(), "[run]\nmain = \"com.seeyon.App\"\n");
+        assert_eq!(project.read_file("/project/.openidea/run.toml").unwrap(), "[run]\nmain = \"com.seeyon.App\"\n");
+
+        // An existing file is replaced whole, under either spelling of the path.
+        project.write_file("src/a.txt", b"bye").unwrap();
+        assert_eq!(project.read_file("src/a.txt").unwrap(), "bye");
+        project.write_file("/project/src/a.txt", b"bye again").unwrap();
+        assert_eq!(project.read_file("src/a.txt").unwrap(), "bye again");
+
+        // Bytes that are not text are kept, and reading them back as text fails.
+        project.write_file("src/app.bin", &[0xff, 0x00, 0x7f]).unwrap();
+        assert!(matches!(project.read_file("src/app.bin"), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn project_write_refuses_paths_outside_the_root() {
+        let mock = MockHost::install().with_capabilities(&["project.read", "project.write"]);
+        let project = mock.invocation().project().unwrap();
+        assert!(matches!(project.write_file("../etc/passwd", b"x"), Err(Error::Invalid(_))));
+        assert!(matches!(project.write_file("src/../../etc/passwd", b"x"), Err(Error::Invalid(_))));
+        assert!(matches!(project.write_file("/other/x", b"x"), Err(Error::Invalid(_))));
+        assert_eq!(
+            project.read_file("../etc/passwd"),
+            Err(Error::Invalid("../etc/passwd: access outside the project root is not allowed".into()))
+        );
+
+        // A file with unsaved editor changes is refused, as on the real host.
+        mock.add_file("src/a.txt", "hello");
+        mock.open_editor("/project/src/a.txt", "text", "hello edited", &[]);
+        assert!(matches!(project.write_file("src/a.txt", b"bye"), Err(Error::Invalid(_))));
+        assert_eq!(project.read_file("src/a.txt").unwrap(), "hello edited");
     }
 }
