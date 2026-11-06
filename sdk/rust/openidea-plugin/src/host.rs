@@ -109,6 +109,10 @@ mod imp {
         p.read_file(path).map_err(error)
     }
 
+    pub fn project_write(p: &ProjectRes, path: &str, bytes: &[u8]) -> Result<(), Error> {
+        p.write_file(path, bytes).map_err(error)
+    }
+
     pub fn fs_read_text(path: &str) -> Result<String, Error> {
         wit::fs::read_text(path).map_err(error)
     }
@@ -369,6 +373,17 @@ impl Project {
     /// unsaved editor contents win. Needs `project.read`.
     pub fn read_file(&self, path: &str) -> Result<String, Error> {
         imp::project_read(&self.inner, path)
+    }
+
+    /// Replaces (or creates) a file inside the project, given as an absolute or
+    /// root-relative path; paths escaping the root are refused. Missing parent
+    /// directories are created and the whole file is replaced at once, so a
+    /// failed write leaves the old contents. Bytes are written as-is (a new file
+    /// is UTF-8, an existing one keeps its encoding and BOM); a file with unsaved
+    /// editor changes is refused. Needs `project.write`; `project.read` is not
+    /// implied.
+    pub fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), Error> {
+        imp::project_write(&self.inner, path, bytes)
     }
 
     /// The repository containing the project (`None`: not under git). Needs `vcs.read`.

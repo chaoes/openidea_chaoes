@@ -18,6 +18,8 @@ pub enum Capability {
     EditorRead,
     /// Edit the focused editor (versioned edits).
     EditorWrite,
+    /// Create and replace files inside the project root.
+    ProjectWrite,
     VcsRead,
     VcsWrite,
     /// The plugin's own key-value store and data directory.
@@ -56,9 +58,13 @@ impl Capability {
     pub fn risk(&self) -> Risk {
         match self {
             Self::ProjectRead | Self::EditorRead | Self::Storage | Self::Events | Self::VcsRead => Risk::Low,
-            Self::EditorWrite | Self::VcsWrite | Self::Net(_) | Self::Secrets | Self::InputEvents | Self::Clipboard => {
-                Risk::Medium
-            }
+            Self::EditorWrite
+            | Self::ProjectWrite
+            | Self::VcsWrite
+            | Self::Net(_)
+            | Self::Secrets
+            | Self::InputEvents
+            | Self::Clipboard => Risk::Medium,
             Self::Process(_) | Self::FsRead(_) | Self::FsWrite(_) => Risk::High,
         }
     }
@@ -75,6 +81,7 @@ impl Capability {
             Self::ProjectRead => "Read files in the open project".into(),
             Self::EditorRead => "Read the focused editor's file and selection".into(),
             Self::EditorWrite => "Change text in the editor".into(),
+            Self::ProjectWrite => "Create and change files in the open project".into(),
             Self::VcsRead => "Read version control state".into(),
             Self::VcsWrite => "Change version control state (commit, fetch, checkout)".into(),
             Self::Storage => "Store its own data".into(),
@@ -119,6 +126,7 @@ impl fmt::Display for Capability {
             Self::ProjectRead => f.write_str("project.read"),
             Self::EditorRead => f.write_str("editor.read"),
             Self::EditorWrite => f.write_str("editor.write"),
+            Self::ProjectWrite => f.write_str("project.write"),
             Self::VcsRead => f.write_str("vcs.read"),
             Self::VcsWrite => f.write_str("vcs.write"),
             Self::Storage => f.write_str("storage"),
@@ -175,6 +183,7 @@ impl FromStr for Capability {
             "project.read" | "project-read" => Self::ProjectRead,
             "editor.read" | "editor-read" => Self::EditorRead,
             "editor.write" | "editor-write" => Self::EditorWrite,
+            "project.write" | "project-write" => Self::ProjectWrite,
             "vcs.read" => Self::VcsRead,
             "vcs.write" => Self::VcsWrite,
             "storage" => Self::Storage,
@@ -227,6 +236,7 @@ mod tests {
     fn parses_and_prints() {
         for s in [
             "project.read",
+            "project.write",
             "editor.write",
             "vcs.write",
             "storage",
@@ -265,6 +275,11 @@ mod tests {
         assert_eq!("clipboard".parse::<Capability>().unwrap(), Capability::Clipboard);
         assert_eq!(Capability::Clipboard.risk(), Risk::Medium);
         assert_eq!(Capability::Process("cargo".into()).risk(), Risk::High);
+        assert_eq!(Capability::ProjectWrite.risk(), Risk::Medium);
+        assert_eq!(Capability::ProjectWrite.describe(), "Create and change files in the open project");
+        assert!(!Capability::ProjectWrite.auto_migrates());
+        assert!(Capability::ProjectWrite.covers(&Capability::ProjectWrite));
+        assert!(!Capability::ProjectWrite.covers(&Capability::ProjectRead));
         assert!(Capability::Storage.auto_migrates() && !Capability::EditorWrite.auto_migrates());
     }
 

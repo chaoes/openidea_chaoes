@@ -1,4 +1,4 @@
-package openidea:plugin@1.4.0;
+package openidea:plugin@1.5.0;
 
 interface workspace {
     use types.{error};
@@ -15,6 +15,13 @@ interface workspace {
         /// at most `limit`, as absolute paths. Ignored and excluded files are
         /// skipped. Requires `project.read`.
         find-files: func(glob: string, limit: u32) -> result<list<string>, error>;
+        /// Writes `bytes` to a file inside the project (absolute, or relative to
+        /// the root); paths leaving the root are refused and missing parent
+        /// directories are created. The file is replaced in one step, so a
+        /// reader never sees half of it. An open editor with unsaved changes
+        /// for that file is left alone (`invalid`: save it first). Requires
+        /// `project.write`.
+        write-file: func(path: string, bytes: list<u8>) -> result<_, error>;
     }
 
     /// Projects open in any window. Requires `project.read`.

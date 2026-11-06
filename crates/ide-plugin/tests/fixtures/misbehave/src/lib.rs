@@ -5,8 +5,8 @@ wit_bindgen::generate!({
     inline: "
         package fixture:misbehave;
         world misbehave {
-            include openidea:plugin/plugin-syntax@1.4.0;
-            export openidea:plugin/providers@1.4.0;
+            include openidea:plugin/plugin-syntax@1.5.0;
+            export openidea:plugin/providers@1.5.0;
         }
     ",
     path: "../../../../../wit",
@@ -67,6 +67,11 @@ impl commands::Guest for Misbehave {
             // The `fs.write` grants: replaces the file at `arg`.
             "fswrite" => {
                 openidea::plugin::fs::write_text(&arg.unwrap_or_default(), "written by the plugin\n").map(|()| None)
+            }
+            // The `project.write` grant: writes `arg` inside the project.
+            "projwrite" => {
+                let project = ctx.project().ok_or_else(|| failed("no project is open"))?;
+                project.write_file(&arg.unwrap_or_default(), b"written inside the project\n").map(|()| None)
             }
             // `editor.write` is not granted: an error, not a trap.
             "insert" => {

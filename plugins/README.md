@@ -197,6 +197,7 @@ machine. Users can revoke optional capabilities in Settings › Plugins.
 | Capability          | Risk   | Unlocks today                                                                       |
 | ------------------- | ------ | ----------------------------------------------------------------------------------- |
 | `project.read`      | low    | `Project::root`, `read_file`, `find_files`, `host::projects`, `publish_diagnostics` |
+| `project.write`     | medium | `Project::write_file`: create and replace files inside the project root             |
 | `editor.read`       | low    | `TextEditor::document`, `selections`                                                |
 | `editor.write`      | medium | `TextEditor::apply_edits`                                                           |
 | `vcs.read`          | low    | `Project::vcs_status` (branch, upstream, ahead/behind, changes), `vcs_remotes`      |
@@ -236,6 +237,14 @@ keep the file's encoding and BOM (a new file is UTF-8), are capped at 16 MiB,
 and are refused while the editor holds unsaved changes for the same file. The
 path is resolved as a read's is, so a link inside a granted directory cannot be
 used to write outside it.
+
+`project.write` grants `Project::write_file`: creating and replacing files
+**inside** the project the plugin runs for, so a plugin can write the files a
+tool keeps next to the code (a run configuration in `.openidea/`, a build
+descriptor). The path is taken relative to the project root (or absolute inside
+it), missing directories are created, and anything resolving outside the root —
+`..`, a symlink — is refused. Like `fs.write` it is atomic, is refused while the
+editor holds unsaved changes for that file, and does not imply `project.read`.
 
 Logging, notifications, status bar items, tasks and run-time contributions
 are always available. Calling a gated function without its capability returns

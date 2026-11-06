@@ -150,6 +150,17 @@ fn misbehave_writable(dir: &Path, granted: &Path) -> PathBuf {
     pkg
 }
 
+/// `misbehave` with `project.write` added to its capabilities.
+fn misbehave_project_writer(dir: &Path) -> PathBuf {
+    let pkg = dir.join("misbehave-writer");
+    copy_dir(&misbehave_pkg(), &pkg);
+    let manifest = pkg.join("plugin.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    let text = text.replace("required = [\"project.read\"]", "required = [\"project.read\", \"project.write\"]");
+    std::fs::write(&manifest, text).unwrap();
+    pkg
+}
+
 /// Whether `f` holds within 5 s. A call a slow runner keeps waiting behind
 /// another (or behind a new instance starting) holds once it caught up.
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
@@ -479,6 +490,49 @@ fn fs_write_reaches_only_the_granted_paths() {
     assert_eq!((info.status, info.stats.crashes, info.stats.errors), (PluginStatus::Active, 0, 0), "{info:?}");
 }
 
+/// `project.write` creates and replaces files under the project root, and never
+/// leaves it, through the real component.
+#[test]
+fn project_write_stays_inside_the_project() {
+    let f = fixture(Limits::default());
+    f.install(&misbehave_project_writer(f._tmp.path()));
+
+    // A Run configuration: neither the file nor `.openidea/` exists yet.
+    assert_eq!(f.run("misbehave", "projwrite", Some(".openidea/run.toml")).unwrap(), None);
+    let conf = f.project.join(".openidea").join("run.toml");
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), "written inside the project\n");
+    // What it wrote reads back through the project, and an absolute path inside
+    // the root lands in the same place.
+    assert_eq!(
+        f.run("misbehave", "read", Some(".openidea/run.toml")).unwrap().as_deref(),
+        Some("written inside the project\n")
+    );
+    let fresh = f.project.join("build").join("patch.txt");
+    assert_eq!(f.run("misbehave", "projwrite", Some(fresh.to_str().unwrap())).unwrap(), None);
+    assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "written inside the project\n");
+    // Replacing an existing file rewrites it whole.
+    assert_eq!(f.run("misbehave", "projwrite", Some("src/notes.txt")).unwrap(), None);
+    assert_eq!(std::fs::read_to_string(f.project.join("src/notes.txt")).unwrap(), "written inside the project\n");
+
+    // Leaving the root is refused, and nothing lands outside.
+    for path in ["../escape.txt", "src/../../escape.txt"] {
+        let err = f.run("misbehave", "projwrite", Some(path)).unwrap_err();
+        assert!(err.contains("outside the project root"), "{path}: {err}");
+    }
+    assert!(!f._tmp.path().join("escape.txt").exists(), "nothing was written outside the project");
+
+    // A refusal is the plugin's to handle, like any other error it gets.
+    let info = f.host.info_of("misbehave").unwrap();
+    assert_eq!((info.status, info.stats.crashes, info.stats.errors), (PluginStatus::Active, 0, 0), "{info:?}");
+
+    // Without the grant, the same call names what it needs.
+    let plain = fixture(Limits::default());
+    plain.install(&misbehave_pkg());
+    let err = plain.run("misbehave", "projwrite", Some("x.txt")).unwrap_err();
+    assert!(err.contains("project.write"), "the refusal names what to grant: {err}");
+    assert!(!plain.project.join("x.txt").exists(), "nothing was written");
+}
+
 /// A missing capability is an error the plugin can handle, not a trap.
 #[test]
 fn ungranted_capabilities_are_denied_not_trapped() {
@@ -755,7 +809,7 @@ fn idle_instances_are_reclaimed_and_schedules_reactivate() {
     assert_eq!(f.host.instances(), 0);
     let info = f.host.info_of("misbehave").unwrap();
     assert_eq!((info.status, info.stats.reclaims), (PluginStatus::Inactive, 1));
-    assert_eq!(f.command_titles("misbehave").len(), 12, "contributions stay");
+    assert_eq!(f.command_titles("misbehave").len(), 13, "contributions stay");
     assert_eq!(f.run("misbehave", "echo", Some("y")).unwrap().as_deref(), Some("y"));
     assert_eq!(f.host.info_of("misbehave").unwrap().stats.activations, 2);
 

@@ -34,7 +34,7 @@ use views_bindings::exports::openidea::plugin::view_provider as wit_view;
 use views_bindings::openidea::plugin::view_types as wit_vt;
 
 /// The API version of the world above, `major.minor` of [`host_api`].
-pub const API_VERSION: &str = "1.4";
+pub const API_VERSION: &str = "1.5";
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 pub(crate) const MAX_TEXT: usize = 1 << 20;
 pub(crate) const MAX_TITLE: usize = 256;
@@ -136,6 +136,10 @@ pub trait HostApi: Send + Sync {
     fn write_text_file(&self, real: &Path, text: &str, max: usize) -> Result<(), HostError>;
     /// Replaces the bytes of a file outside the project, at most `max`.
     fn write_bytes_file(&self, real: &Path, bytes: &[u8], max: usize) -> Result<(), HostError>;
+    /// Writes `bytes` to a file inside the project, whose real path the caller
+    /// confined to that project's root: parents are created as needed and the
+    /// file is replaced in one step. `max` bounds the bytes written.
+    fn write_project_file(&self, real: &Path, bytes: &[u8], max: usize) -> Result<(), HostError>;
 }
 
 /// Shared compilation engine plus an epoch ticker thread for wall-clock limits.
