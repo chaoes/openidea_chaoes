@@ -74,20 +74,24 @@ const CONTEXT_MENUS: Record<string, ContextMenuId> = {
   "editorTab.context": "editorTab",
 };
 
-const contextItems = new Map<string, { pluginId: string; decl: MenuDecl }>();
+const contextItems = new Map<string, { pluginId: string; pluginName: string; decl: MenuDecl }>();
 let menuSeq = 0;
 
-/** Plugin items of a context menu: their command's action with the menu's file as argument. */
+/** Plugin items of a context menu, one submenu per plugin, each entry naming the menu's file. */
 export function pluginMenuItems(menu: ContextMenuId, paths: readonly string[]): MenuItem[] {
-  const out: MenuItem[] = [];
-  for (const { pluginId, decl } of contextItems.values()) {
+  const groups = new Map<string, { name: string; items: MenuItem[] }>();
+  for (const { pluginId, pluginName, decl } of contextItems.values()) {
     if (CONTEXT_MENUS[decl.menu] !== menu || !evaluateWhen(decl.when ?? undefined)) continue;
     const action = pluginActionId(pluginId, decl.command);
     if (!getAction(action)) continue;
     // The editor menu runs with the focused editor; the others name their file.
-    out.push({ kind: "action", action, arg: menu === "editor" ? undefined : paths[0] });
+    const item: MenuItem = { kind: "action", action, arg: menu === "editor" ? undefined : paths[0] };
+    const group = groups.get(pluginId);
+    if (group) group.items.push(item);
+    else groups.set(pluginId, { name: pluginName, items: [item] });
   }
-  return out;
+  // Plugins keep their contributions in one place, so the menu stays readable as they grow.
+  return [...groups.values()].map(({ name, items }) => ({ label: name, submenu: items }));
 }
 
 function projectMenu(pluginId: string, decl: MenuDecl, plugin: PluginInfo): () => void {
@@ -97,7 +101,7 @@ function projectMenu(pluginId: string, decl: MenuDecl, plugin: PluginInfo): () =
     return registerMenuSlotItem("pluginTools", { action, label: title });
   }
   const key = `${++menuSeq}`;
-  contextItems.set(key, { pluginId, decl });
+  contextItems.set(key, { pluginId, pluginName: plugin.name, decl });
   return () => void contextItems.delete(key);
 }
 

@@ -161,14 +161,16 @@ describe("plugin keymaps", () => {
 });
 
 describe("plugin menus", () => {
-  it("projects context menu entries for their command's action", () => {
-    const off = registerAction({ id: "plugin.p.check", title: "Check", run: () => {} });
+  it("puts the entries of each plugin under one submenu", () => {
+    const offCheck = registerAction({ id: "plugin.p.check", title: "Check", run: () => {} });
+    const offFix = registerAction({ id: "plugin.q.fix", title: "Fix", run: () => {} });
     const plugin = {
       id: "p",
       name: "P",
       status: "active",
       enabled: true,
     } as unknown as Parameters<typeof syncUiContributions>[1][number];
+    const other = { ...plugin, id: "q", name: "Q" };
     syncUiContributions(
       [
         {
@@ -178,19 +180,27 @@ describe("plugin menus", () => {
           decl: { menu: "projectView.context", command: "check" },
         },
         {
+          pluginId: "q",
+          point: "menus",
+          key: "projectView.context/fix",
+          decl: { menu: "projectView.context", command: "fix" },
+        },
+        {
           pluginId: "p",
           point: "menus",
           key: "editor.context/check",
           decl: { menu: "editor.context", command: "check", when: "false" },
         },
       ],
-      [plugin],
+      [plugin, other],
     );
     expect(pluginMenuItems("projectView", ["/p/a.java"])).toEqual([
-      { kind: "action", action: "plugin.p.check", arg: "/p/a.java" },
+      { label: "P", submenu: [{ kind: "action", action: "plugin.p.check", arg: "/p/a.java" }] },
+      { label: "Q", submenu: [{ kind: "action", action: "plugin.q.fix", arg: "/p/a.java" }] },
     ]);
     expect(pluginMenuItems("editor", ["/p/a.java"])).toEqual([]);
-    off();
+    offCheck();
+    offFix();
   });
 });
 
