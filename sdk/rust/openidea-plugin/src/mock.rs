@@ -5,7 +5,7 @@
 //! editor with a versioned document, and enforces the capabilities you give
 //! it like the real host (a missing one returns [`Error::Denied`]).
 
-use crate::host::Invocation;
+use crate::host::{Invocation, PathKind};
 use crate::types::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,6 +55,8 @@ struct State {
     root: Option<String>,
     other_projects: Vec<String>,
     files: BTreeMap<String, String>,
+    /// Files outside every project, for `fs.read` (absolute paths).
+    external: BTreeMap<String, String>,
     editor: Option<Editor>,
     notifications: Vec<Notification>,
     logs: Vec<(LogLevel, String)>,
@@ -142,6 +144,13 @@ impl MockHost {
     /// A project file `read_file` can return (project-relative or absolute path).
     pub fn add_file(&self, path: &str, text: &str) {
         self.state.borrow_mut().files.insert(path.to_owned(), text.to_owned());
+    }
+
+    /// A file outside every project, for [`crate::host::fs_read_text`]: it is
+    /// readable once an `fs.read:<a directory above it>` capability is granted.
+    /// Directories are inferred from the paths it holds.
+    pub fn add_external_file(&self, path: &str, text: &str) {
+        self.state.borrow_mut().external.insert(path.to_owned(), text.to_owned());
     }
 
     /// Focuses an editor on `text` with selections `(line, col, line, col)`.
@@ -361,6 +370,43 @@ pub mod current {
         if s.capabilities.iter().any(|c| c == cap) { Ok(()) } else { Err(Error::Denied(cap.to_owned())) }
     }
 
+    /// `fs.read:<base>` covers `<base>` itself and what is under it: `/a` covers
+    /// `/a/b` but not `/ab`.
+    fn require_fs(s: &State, path: &str) -> Result<(), Error> {
+        let covered = s.capabilities.iter().any(|c| match c.strip_prefix("fs.read:") {
+            Some(base) => {
+                let base = base.trim_end_matches(['/', '\\']);
+                !base.is_empty()
+                    && (path == base
+                        || matches!(path.strip_prefix(base), Some(rest) if rest.starts_with('/') || rest.starts_with('\\')))
+            }
+            None => false,
+        });
+        if covered { Ok(()) } else { Err(Error::Denied(format!("fs.read:{path}"))) }
+    }
+
+    /// The paths `fs` takes are absolute; `~/…` is the user's home on the real
+    /// host, and the mock resolves nothing, so add it to the mock as it is.
+    fn check_absolute(path: &str) -> Result<(), Error> {
+        let bytes = path.as_bytes();
+        let drive = bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\');
+        if path.starts_with('/') || drive {
+            Ok(())
+        } else {
+            Err(Error::Invalid(format!("{path}: use an absolute path (or ~/…)")))
+        }
+    }
+
+    /// `fs` checks what the real host checks, minus canonicalisation: absolute
+    /// path, then a grant covering it.
+    fn check_external(s: &State, path: &str) -> Result<(), Error> {
+        check_absolute(path)?;
+        require_fs(s, path)
+    }
+
     pub fn log(level: LogLevel, message: &str) {
         with(|s| s.logs.push((level, message.to_owned())))
     }
@@ -453,6 +499,39 @@ pub mod current {
                 return Ok(e.text.clone());
             }
             s.files.get(rel).or_else(|| s.files.get(path)).cloned().ok_or_else(|| Error::NotFound(path.into()))
+        })
+    }
+
+    pub fn fs_read_text(path: &str) -> Result<String, Error> {
+        with(|s| {
+            check_external(s, path)?;
+            // Unsaved editor contents win, as on the real host.
+            if let Some(e) = s.editor.as_ref().filter(|e| e.path == path) {
+                return Ok(e.text.clone());
+            }
+            s.external.get(path).cloned().ok_or_else(|| Error::NotFound(path.into()))
+        })
+    }
+
+    pub fn fs_read_bytes(path: &str) -> Result<Vec<u8>, Error> {
+        with(|s| {
+            check_external(s, path)?;
+            let text = s.external.get(path).ok_or_else(|| Error::NotFound(path.into()))?;
+            Ok(text.clone().into_bytes())
+        })
+    }
+
+    pub fn fs_path_kind(path: &str) -> Result<PathKind, Error> {
+        with(|s| {
+            check_external(s, path)?;
+            if s.external.contains_key(path) {
+                return Ok(PathKind::File);
+            }
+            // A directory is a prefix of the files the mock holds.
+            let holds_files = s.external.keys().any(
+                |file| matches!(file.strip_prefix(path), Some(rest) if rest.starts_with('/') || rest.starts_with('\\')),
+            );
+            if holds_files { Ok(PathKind::Directory) } else { Err(Error::NotFound(path.into())) }
         })
     }
 
@@ -800,5 +879,39 @@ mod tests {
         host::publish_diagnostics("/project/a.java", &[Diagnostic::new(Range::default(), Severity::Warning, "m")])
             .unwrap();
         assert_eq!(mock.diagnostics()["/project/a.java"].len(), 1);
+    }
+
+    #[test]
+    fn fs_read_needs_a_grant_covering_the_file() {
+        let mock = MockHost::install();
+        mock.add_external_file("/opt/seeyon/app.properties", "name=YonBIP\n");
+        assert_eq!(
+            host::fs_read_text("/opt/seeyon/app.properties"),
+            Err(Error::Denied("fs.read:/opt/seeyon/app.properties".into()))
+        );
+
+        let mock = MockHost::install().with_capabilities(&["fs.read:/opt/seeyon"]);
+        mock.add_external_file("/opt/seeyon/app.properties", "name=YonBIP\n");
+        mock.add_external_file("/opt/seeyon/conf/licence.xml", "<licence/>");
+        mock.add_external_file("/opt/seeyonx/app.properties", "other\n");
+        assert_eq!(host::fs_read_text("/opt/seeyon/app.properties").unwrap(), "name=YonBIP\n");
+        assert_eq!(host::fs_read_bytes("/opt/seeyon/app.properties").unwrap(), b"name=YonBIP\n".to_vec());
+        assert_eq!(host::fs_path_kind("/opt/seeyon/app.properties"), Ok(PathKind::File));
+        assert_eq!(host::fs_path_kind("/opt/seeyon/conf"), Ok(PathKind::Directory));
+        assert!(PathKind::File.is_file() && PathKind::Directory.is_dir());
+
+        // Unsaved editor contents win for `fs_read_text`, as on the real host; bytes come from disk.
+        mock.open_editor("/opt/seeyon/conf/licence.xml", "xml", "<licence edited/>", &[]);
+        assert_eq!(host::fs_read_text("/opt/seeyon/conf/licence.xml").unwrap(), "<licence edited/>");
+        assert_eq!(host::fs_read_bytes("/opt/seeyon/conf/licence.xml").unwrap(), b"<licence/>".to_vec());
+
+        // A granted directory is not a string prefix: `/opt/seeyon` does not cover `/opt/seeyonx`.
+        assert!(matches!(host::fs_read_text("/opt/seeyonx/app.properties"), Err(Error::Denied(_))));
+        // Relative paths and missing files are path errors, not grant errors.
+        assert!(matches!(host::fs_read_text("opt/seeyon/app.properties"), Err(Error::Invalid(_))));
+        assert_eq!(
+            host::fs_read_text("/opt/seeyon/missing.properties"),
+            Err(Error::NotFound("/opt/seeyon/missing.properties".into()))
+        );
     }
 }

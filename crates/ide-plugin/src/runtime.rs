@@ -5,7 +5,7 @@
 
 use crate::types::{CodeAction, CompletionItem, InlineSuggestion, LineMarker, Location, ProviderDocument};
 use crate::types::{
-    EventKind, HostError, HttpRequest, HttpResponse, Invocation, Limits, NotificationLevel, ProcessOutput,
+    EventKind, HostError, HttpRequest, HttpResponse, Invocation, Limits, NotificationLevel, PathKind, ProcessOutput,
     RepositoryStatus, StatusItem, SyntaxFold, SyntaxSymbol, SyntaxToken, WorkbenchEvent,
 };
 use crate::types::{
@@ -34,7 +34,7 @@ use views_bindings::exports::openidea::plugin::view_provider as wit_view;
 use views_bindings::openidea::plugin::view_types as wit_vt;
 
 /// The API version of the world above, `major.minor` of [`host_api`].
-pub const API_VERSION: &str = "1.2";
+pub const API_VERSION: &str = "1.3";
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 pub(crate) const MAX_TEXT: usize = 1 << 20;
 pub(crate) const MAX_TITLE: usize = 256;
@@ -122,6 +122,14 @@ pub trait HostApi: Send + Sync {
     fn open_location(&self, client: Option<&str>, path: &Path, line: u32, column: u32) -> Result<(), HostError>;
     /// A setting of the plugin as JSON (project over global over the schema default).
     fn setting(&self, root: Option<&Path>, key: &str) -> Option<String>;
+    /// Reads and decodes a text file outside the project, whose real path an
+    /// `fs.read` grant already covers: the unsaved buffer wins, then the disk.
+    /// `max` bounds the bytes read.
+    fn read_text_file(&self, real: &Path, max: usize) -> Result<String, HostError>;
+    /// The bytes of a file outside the project, at most `max`.
+    fn read_bytes_file(&self, real: &Path, max: usize) -> Result<Vec<u8>, HostError>;
+    /// Whether the granted path is a file or a directory.
+    fn path_kind(&self, real: &Path) -> Result<PathKind, HostError>;
 }
 
 /// Shared compilation engine plus an epoch ticker thread for wall-clock limits.

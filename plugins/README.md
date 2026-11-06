@@ -204,6 +204,7 @@ machine. Users can revoke optional capabilities in Settings › Plugins.
 | `storage`           | low    | `host::storage` (1 MiB per plugin)                                                  |
 | `events`            | low    | file opened/saved, editor focused, repository changed events                        |
 | `events.input`      | medium | `action-performed` events (which actions you run, and how)                          |
+| `fs.read:<path>`    | high   | `host::fs_read_text`, `fs_read_bytes`, `fs_path_kind` for files under that path     |
 | `process:<program>` | high   | `Project::run_process`, language servers, debug adapters, runs                      |
 | `net:<host>`        | medium | `host::fetch` to that host (`*.example.com`: its subdomains)                        |
 | `secrets`           | medium | `{{secret:<name>}}` in request headers, `host::secret_is_set`                       |
@@ -216,8 +217,16 @@ working. On grant the program is resolved to an absolute path and its content
 hash is recorded; it is checked again right before every start, and a replaced
 file is refused until the user approves it again. In a remote project the
 server resolves and pins the program on its own machine (see _Remote
-projects_). `fs.read:<path>` can be declared and granted; it unlocks nothing
-yet.
+projects_).
+
+`fs.read:<path>` grants reading outside the open projects: a directory (its
+files, at any depth) or one file. The path is resolved to its real location
+before it is compared, so a symlink pointing out of the granted directory is
+refused, and a sibling whose name merely starts with the granted one (`/opt/see`
+vs `/opt/seeyon`) is not covered. Granting a whole file system (`/`, `C:\`) is
+refused when the manifest is read: declare the directories you need. Reads are
+capped — text over the limit fails rather than truncating, and files that are
+not text have to be read as bytes.
 
 Logging, notifications, status bar items, tasks and run-time contributions
 are always available. Calling a gated function without its capability returns
