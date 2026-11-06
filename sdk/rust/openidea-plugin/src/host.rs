@@ -126,6 +126,14 @@ mod imp {
         })
     }
 
+    pub fn fs_write_text(path: &str, text: &str) -> Result<(), Error> {
+        wit::fs::write_text(path, text).map_err(error)
+    }
+
+    pub fn fs_write_bytes(path: &str, bytes: &[u8]) -> Result<(), Error> {
+        wit::fs::write_bytes(path, bytes).map_err(error)
+    }
+
     pub fn invocation_project(i: InvocationRef<'_>) -> Option<ProjectRes> {
         i.project()
     }
@@ -503,6 +511,29 @@ pub fn fs_read_bytes(path: &str) -> Result<Vec<u8>, Error> {
 /// `fs.read:<path>`.
 pub fn fs_path_kind(path: &str) -> Result<PathKind, Error> {
     imp::fs_path_kind(path)
+}
+
+/// Replaces a text file outside the project, creating it when it is not there,
+/// at most 16 MiB. The write is atomic and keeps the file's encoding and BOM (a
+/// new file is UTF-8); `path` is absolute, or starts with `~/` for the user's
+/// home.
+///
+/// Fails with [`Error::Invalid`] when the parent directory is missing, the path
+/// is a directory, the text cannot be written in the file's encoding, or an
+/// editor holds unsaved changes for the file — save those first.
+///
+/// Needs an `fs.write:<path>` grant covering the file. Writing does not imply
+/// reading: a plugin that reads back what it wrote needs `fs.read:` too.
+pub fn fs_write_text(path: &str, text: &str) -> Result<(), Error> {
+    imp::fs_write_text(path, text)
+}
+
+/// Replaces the bytes of a file outside the project (images, class files,
+/// archives), creating it when it is not there, at most 16 MiB, atomically. The
+/// same failures as [`fs_write_text`], minus the encoding. Needs
+/// `fs.write:<path>`, as [`fs_write_text`] does.
+pub fn fs_write_bytes(path: &str, bytes: &[u8]) -> Result<(), Error> {
+    imp::fs_write_bytes(path, bytes)
 }
 
 /// A file open in an editor.

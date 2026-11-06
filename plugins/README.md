@@ -205,6 +205,7 @@ machine. Users can revoke optional capabilities in Settings › Plugins.
 | `events`            | low    | file opened/saved, editor focused, repository changed events                        |
 | `events.input`      | medium | `action-performed` events (which actions you run, and how)                          |
 | `fs.read:<path>`    | high   | `host::fs_read_text`, `fs_read_bytes`, `fs_path_kind` for files under that path     |
+| `fs.write:<path>`   | high   | `host::fs_write_text`, `fs_write_bytes` for files under that path                   |
 | `process:<program>` | high   | `Project::run_process`, language servers, debug adapters, runs                      |
 | `net:<host>`        | medium | `host::fetch` to that host (`*.example.com`: its subdomains)                        |
 | `secrets`           | medium | `{{secret:<name>}}` in request headers, `host::secret_is_set`                       |
@@ -227,6 +228,14 @@ vs `/opt/seeyon`) is not covered. Granting a whole file system (`/`, `C:\`) is
 refused when the manifest is read: declare the directories you need. Reads are
 capped — text over the limit fails rather than truncating, and files that are
 not text have to be read as bytes.
+
+`fs.write:<path>` grants replacing files outside the projects under that path,
+creating them when they are not there. A write is separate from a read and does
+not imply one. Writes are atomic (a temporary file is renamed over the old one),
+keep the file's encoding and BOM (a new file is UTF-8), are capped at 16 MiB,
+and are refused while the editor holds unsaved changes for the same file. The
+path is resolved as a read's is, so a link inside a granted directory cannot be
+used to write outside it.
 
 Logging, notifications, status bar items, tasks and run-time contributions
 are always available. Calling a gated function without its capability returns

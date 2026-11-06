@@ -36,6 +36,8 @@ pub enum Capability {
     Process(String),
     /// Read files outside the project under one path.
     FsRead(String),
+    /// Write files outside the project under one path.
+    FsWrite(String),
 }
 
 /// How a grant is presented (plan 4.2).
@@ -57,7 +59,7 @@ impl Capability {
             Self::EditorWrite | Self::VcsWrite | Self::Net(_) | Self::Secrets | Self::InputEvents | Self::Clipboard => {
                 Risk::Medium
             }
-            Self::Process(_) | Self::FsRead(_) => Risk::High,
+            Self::Process(_) | Self::FsRead(_) | Self::FsWrite(_) => Risk::High,
         }
     }
 
@@ -85,6 +87,7 @@ impl Capability {
             Self::Net(host) => format!("Connect to {host} (from the machine the project is on)"),
             Self::Process(bin) => format!("Run {bin} — equivalent to running arbitrary code on this machine"),
             Self::FsRead(path) => format!("Read files under {path}, outside the project"),
+            Self::FsWrite(path) => format!("Change files under {path}, outside the project"),
         }
     }
 
@@ -92,7 +95,7 @@ impl Capability {
     pub fn covers(&self, wanted: &Capability) -> bool {
         match (self, wanted) {
             (Self::Net(pattern), Self::Net(host)) => host_matches(pattern, host),
-            (Self::FsRead(base), Self::FsRead(path)) => {
+            (Self::FsRead(base), Self::FsRead(path)) | (Self::FsWrite(base), Self::FsWrite(path)) => {
                 std::path::Path::new(path).starts_with(std::path::Path::new(base))
             }
             _ => self == wanted,
@@ -126,6 +129,7 @@ impl fmt::Display for Capability {
             Self::Net(h) => write!(f, "net:{h}"),
             Self::Process(b) => write!(f, "process:{b}"),
             Self::FsRead(p) => write!(f, "fs.read:{p}"),
+            Self::FsWrite(p) => write!(f, "fs.write:{p}"),
         }
     }
 }
@@ -158,11 +162,11 @@ impl FromStr for Capability {
                     }
                     Ok(Self::Process(arg.to_owned()))
                 }
-                "fs.read" => {
+                "fs.read" | "fs.write" => {
                     if !std::path::Path::new(arg).is_absolute() && !arg.starts_with('~') {
                         return Err(format!("{s:?}: use an absolute path (or ~/…)"));
                     }
-                    Ok(Self::FsRead(arg.to_owned()))
+                    Ok(if kind == "fs.read" { Self::FsRead(arg.to_owned()) } else { Self::FsWrite(arg.to_owned()) })
                 }
                 _ => Err(format!("unknown capability {s:?}")),
             };
@@ -236,12 +240,12 @@ mod tests {
             assert_eq!(s.parse::<Capability>().unwrap().to_string(), s);
         }
         // Absolute paths are the platform's.
-        let (git, etc) = if cfg!(windows) {
-            (r"process:C:\Program Files\Git\bin\git.exe", r"fs.read:C:\Windows")
+        let (git, etc, log) = if cfg!(windows) {
+            (r"process:C:\Program Files\Git\bin\git.exe", r"fs.read:C:\Windows", r"fs.write:C:\Windows\Temp")
         } else {
-            ("process:/usr/bin/git", "fs.read:/etc")
+            ("process:/usr/bin/git", "fs.read:/etc", "fs.write:/var/tmp")
         };
-        for s in [git, etc] {
+        for s in [git, etc, log] {
             assert_eq!(s.parse::<Capability>().unwrap().to_string(), s);
         }
         assert_eq!("project-read".parse::<Capability>().unwrap(), Capability::ProjectRead);
@@ -249,6 +253,7 @@ mod tests {
         assert!("net:a b".parse::<Capability>().is_err());
         assert!("process:./evil".parse::<Capability>().is_err());
         assert!("fs.read:rel".parse::<Capability>().is_err());
+        assert!("fs.write:rel".parse::<Capability>().is_err());
         assert!("network".parse::<Capability>().is_err());
     }
 
@@ -275,5 +280,12 @@ mod tests {
         assert!(any_gh.covers(&"net:api.github.com".parse().unwrap()));
         assert!(Capability::FsRead("/etc".into()).covers(&Capability::FsRead("/etc/hosts".into())));
         assert!(!Capability::FsRead("/etc".into()).covers(&Capability::FsRead("/etcx".into())));
+        assert!(Capability::FsWrite("/etc".into()).covers(&Capability::FsWrite("/etc/hosts".into())));
+        assert!(!Capability::FsWrite("/etc".into()).covers(&Capability::FsWrite("/etcx".into())));
+        // Writing does not carry reading, or the other way round.
+        assert!(!Capability::FsWrite("/etc".into()).covers(&Capability::FsRead("/etc/hosts".into())));
+        assert!(!Capability::FsRead("/etc".into()).covers(&Capability::FsWrite("/etc/hosts".into())));
+        assert_eq!(Capability::FsWrite("/etc".into()).risk(), Risk::High);
+        assert_eq!(Capability::FsWrite("/etc".into()).describe(), "Change files under /etc, outside the project");
     }
 }
