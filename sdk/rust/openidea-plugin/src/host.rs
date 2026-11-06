@@ -7,6 +7,7 @@ use crate::types::*;
 #[cfg(target_arch = "wasm32")]
 mod imp {
     //! Calls through the `openidea:plugin@1.0.0` world.
+    use super::{Chunk, Command};
     use crate::bindings::openidea::plugin as wit;
     use crate::types::*;
 
@@ -322,6 +323,51 @@ mod imp {
             .map_err(error)
     }
 
+    /// The WIT `command` record for a [`Command`].
+    fn command(cmd: &Command) -> wit::process::Command {
+        wit::process::Command { program: cmd.program.clone(), args: cmd.args.clone(), env: cmd.env.clone() }
+    }
+
+    fn output(o: wit::process::Output) -> ProcessOutput {
+        ProcessOutput { status: o.status, stdout: o.stdout, stderr: o.stderr }
+    }
+
+    fn chunk(c: wit::process::Chunk) -> Chunk {
+        Chunk { stdout: c.stdout, stderr: c.stderr, status: c.status }
+    }
+
+    pub fn run_command(cmd: &Command, cwd: Option<&ProjectRes>, stdin: Option<&str>) -> Result<ProcessOutput, Error> {
+        wit::process::run_command(&command(cmd), cwd, stdin).map(output).map_err(error)
+    }
+
+    pub fn start(cmd: &Command, cwd: Option<&ProjectRes>) -> Result<u64, Error> {
+        wit::process::start(&command(cmd), cwd).map_err(error)
+    }
+
+    pub fn child_poll(id: u64, max_bytes: u32) -> Result<Chunk, Error> {
+        wit::process::poll(id, max_bytes).map(chunk).map_err(error)
+    }
+
+    pub fn child_write(id: u64, text: &str) -> Result<(), Error> {
+        wit::process::write(id, text).map_err(error)
+    }
+
+    pub fn child_close_stdin(id: u64) -> Result<(), Error> {
+        wit::process::close_stdin(id).map_err(error)
+    }
+
+    pub fn child_kill(id: u64) -> Result<(), Error> {
+        wit::process::kill(id).map_err(error)
+    }
+
+    pub fn child_wait(id: u64, timeout_ms: u32) -> Result<Chunk, Error> {
+        wit::process::wait(id, timeout_ms).map(chunk).map_err(error)
+    }
+
+    pub fn child_release(id: u64) -> Result<(), Error> {
+        wit::process::release(id).map_err(error)
+    }
+
     pub fn range_from(r: wit::types::Range) -> Range {
         range_in(r)
     }
@@ -496,6 +542,166 @@ pub fn setting_number(key: &str) -> Option<f64> {
 /// (see [`Project::run_process`] to run it in a project).
 pub fn run_process(program: &str, args: &[String], stdin: Option<&str>) -> Result<ProcessOutput, Error> {
     imp::run_process(program, args, None, stdin)
+}
+
+/// What to run: the approved `process:<program>`, its arguments and the
+/// environment it gets on top of the inherited one (see [`run_command`] and
+/// [`start`]).
+///
+/// ```no_run
+/// use openidea_plugin::host::Command;
+///
+/// let cmd = Command::new("java").args(["-jar", "build/harness.jar"]).env("LANG", "en_US.UTF-8");
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Command {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+impl Command {
+    /// A command for the approved `process:<program>`.
+    pub fn new(program: impl Into<String>) -> Self {
+        Self { program: program.into(), args: Vec::new(), env: Vec::new() }
+    }
+
+    /// Adds one argument.
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Adds arguments.
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Adds one environment variable (`name=value`); at most 64.
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// Adds environment variables.
+    pub fn envs<I, K, V>(mut self, envs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.env.extend(envs.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// The program that runs.
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// Its arguments.
+    pub fn arguments(&self) -> &[String] {
+        &self.args
+    }
+
+    /// The variables it adds to the inherited environment.
+    pub fn environment(&self) -> &[(String, String)] {
+        &self.env
+    }
+}
+
+/// What a program printed since the last read, and how it ended (see
+/// [`Child::poll`] and [`Child::wait`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Chunk {
+    pub stdout: String,
+    pub stderr: String,
+    /// Its exit status once it ended, else `None`.
+    pub status: Option<i32>,
+}
+
+/// A program started with [`start`], still running behind a handle: feed its
+/// input with [`Child::write`], read what it printed with [`Child::poll`], end
+/// it with [`Child::kill`]. Dropping it releases the handle (killing the
+/// program if it still runs); the IDE also ends handles when the plugin's
+/// instance stops.
+#[derive(Debug)]
+pub struct Child {
+    id: u64,
+}
+
+impl Child {
+    /// The handle's id, as the IDE assigned it.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// What it printed since the last call (at most `max_bytes` of each; the
+    /// rest stays for the next one), and its exit status once it ended. Does
+    /// not block.
+    pub fn poll(&self, max_bytes: u32) -> Result<Chunk, Error> {
+        imp::child_poll(self.id, max_bytes)
+    }
+
+    /// Writes `text` to its stdin. `Error::Invalid` once it ended or its input
+    /// was closed.
+    pub fn write(&self, text: &str) -> Result<(), Error> {
+        imp::child_write(self.id, text)
+    }
+
+    /// Ends its input, so the program sees end of file.
+    pub fn close_stdin(&self) -> Result<(), Error> {
+        imp::child_close_stdin(self.id)
+    }
+
+    /// Ends it (and its children where the platform allows), keeping the
+    /// handle so [`poll`](Self::poll) / [`wait`](Self::wait) still report what
+    /// it printed and how it ended.
+    pub fn kill(&self) -> Result<(), Error> {
+        imp::child_kill(self.id)
+    }
+
+    /// Waits up to `timeout_ms` (0: only check) for it to end, and reads what
+    /// it printed; `status` is `None` while it still runs.
+    pub fn wait(&self, timeout_ms: u32) -> Result<Chunk, Error> {
+        imp::child_wait(self.id, timeout_ms)
+    }
+
+    /// Forgets the handle, killing the program if it still runs.
+    pub fn release(self) -> Result<(), Error> {
+        imp::child_release(self.id)
+    }
+
+    fn release_quietly(&self) -> Result<(), Error> {
+        imp::child_release(self.id)
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.release_quietly();
+    }
+}
+
+/// Runs [`Command`] (program, arguments and environment) once and waits for
+/// it, in `project`'s root or else the plugin's data directory; `stdin` is
+/// written to it first. At most 4 MiB of each output stream are kept. Needs
+/// `process:<program>`; call it inside a task for anything slow.
+pub fn run_command(cmd: &Command, project: Option<&Project>, stdin: Option<&str>) -> Result<ProcessOutput, Error> {
+    imp::run_command(cmd, project.map(|p| &p.inner), stdin)
+}
+
+/// Starts [`Command`] and returns a handle without waiting, for programs that
+/// serve requests, watch files or wait for input: [`Child::write`] feeds the
+/// input, [`Child::poll`] reads what it printed. At most 8 handles per plugin
+/// (the next call fails with `Error::Invalid`). Needs `process:<program>`.
+pub fn start(cmd: &Command, project: Option<&Project>) -> Result<Child, Error> {
+    Ok(Child { id: imp::start(cmd, project.map(|p| &p.inner))? })
 }
 
 /// Projects open in any window. Needs `project.read`.

@@ -7,12 +7,14 @@ use ide_core::{CancellationToken, TextEdit};
 use ide_extension::Package;
 use ide_language::ProgramPin;
 use ide_plugin::{
-    EventKind, HostApi, HostError, HttpRequest, HttpResponse, NotificationLevel, ProcessOutput, RepositoryStatus,
-    StatusItem,
+    EventKind, HostApi, HostError, HttpRequest, HttpResponse, NotificationLevel, ProcessChunk, ProcessCommand,
+    ProcessOutput, RepositoryStatus, StatusItem,
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -111,6 +113,10 @@ impl SecretStore for FileSecretStore {
 const MAX_RESPONSE: usize = 8 << 20;
 /// Largest stdout / stderr kept from a process.
 const MAX_OUTPUT: usize = 4 << 20;
+/// Most processes one plugin keeps running at once.
+const MAX_PROCESSES: usize = 8;
+/// Most output one stream of a handle holds until the plugin reads it.
+const MAX_PENDING: usize = 1 << 20;
 /// Most files `find-files` walks before giving up.
 const MAX_WALK: usize = 200_000;
 
@@ -151,6 +157,127 @@ struct TaskEntry {
     cancelled: bool,
 }
 
+/// A process a plugin started and has not released (API 1.7 `process.start`).
+/// Two reader threads copy its output into bounded buffers; the handle lives
+/// as long as the plugin instance that started it.
+struct Proc {
+    state: Mutex<ProcState>,
+}
+
+struct ProcState {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    /// What it printed and the plugin hasn't read yet.
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// Its exit status once it ended (a code, or -1 when a signal ended it).
+    status: Option<i32>,
+    /// Reader threads still copying its pipes into the buffers above.
+    readers: usize,
+}
+
+/// Which pipe a reader thread drains.
+#[derive(Clone, Copy)]
+enum Stream {
+    Out,
+    Err,
+}
+
+impl Proc {
+    /// Copies `pipe` into the matching buffer until it closes, keeping the last
+    /// [`MAX_PENDING`] bytes, then notes that the reader finished.
+    fn read(self: &Arc<Self>, mut pipe: impl Read + Send + 'static, stream: Stream) {
+        self.state.lock().readers += 1;
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8 << 10];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut state = this.state.lock();
+                        let out = match stream {
+                            Stream::Out => &mut state.stdout,
+                            Stream::Err => &mut state.stderr,
+                        };
+                        out.extend_from_slice(&buf[..n]);
+                        let over = out.len().saturating_sub(MAX_PENDING);
+                        if over > 0 {
+                            out.drain(..over);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            this.state.lock().readers -= 1;
+        });
+    }
+
+    /// Notes its exit status if it ended (dropping its stdin then).
+    fn reap(&self) -> Result<(), HostError> {
+        let mut state = self.state.lock();
+        if state.status.is_none() {
+            match state.child.try_wait() {
+                Ok(Some(status)) => {
+                    state.status = Some(status.code().unwrap_or(-1));
+                    state.stdin = None;
+                }
+                Ok(None) => {}
+                Err(e) => return Err(failed(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends it and reaps it, so its status is known right away; killing twice
+    /// does nothing.
+    fn kill(&self) {
+        let mut state = self.state.lock();
+        state.stdin = None;
+        if state.status.is_none() {
+            let _ = state.child.kill();
+            if let Ok(status) = state.child.wait() {
+                state.status = Some(status.code().unwrap_or(-1));
+            }
+        }
+    }
+
+    /// What it printed since the last call, each stream at most `max` bytes.
+    fn chunk(&self, max: usize) -> ProcessChunk {
+        let mut state = self.state.lock();
+        ProcessChunk {
+            stdout: take_text(&mut state.stdout, max),
+            stderr: take_text(&mut state.stderr, max),
+            status: state.status,
+        }
+    }
+}
+
+/// Takes up to `max` bytes from the front of `buf` as text without splitting a
+/// character: bytes of an incomplete sequence stay queued for the next call.
+fn take_text(buf: &mut Vec<u8>, max: usize) -> String {
+    if buf.is_empty() {
+        return String::new();
+    }
+    let mut end = max.max(1).min(buf.len());
+    if end < buf.len() {
+        while end > 0 && (buf[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
+        if end == 0 {
+            // The limit falls inside the first character: hand that one over
+            // rather than nothing at all, or the plugin would read forever.
+            end = 1;
+            while end < buf.len() && (buf[end] & 0xC0) == 0x80 {
+                end += 1;
+            }
+        }
+    }
+    let head: Vec<u8> = buf.drain(..end).collect();
+    String::from_utf8_lossy(&head).into_owned()
+}
+
 /// State shared by the host and every plugin's [`PluginApi`].
 pub(super) struct Shared {
     pub sink: Arc<dyn PluginEventSink>,
@@ -159,6 +286,9 @@ pub(super) struct Shared {
     pub data_dir: PathBuf,
     tasks: Mutex<HashMap<u64, TaskEntry>>,
     next_task: AtomicU64,
+    /// (plugin, handle id) → the processes it started and hasn't released.
+    processes: Mutex<HashMap<(String, u64), Arc<Proc>>>,
+    next_process: AtomicU64,
     /// (plugin, item id) → item, for windows opened later.
     status: Mutex<BTreeMap<(String, String), StatusItem>>,
     /// plugin → kinds subscribed at run time (kept across idle reclaim).
@@ -188,6 +318,8 @@ impl Shared {
             data_dir,
             tasks: Mutex::default(),
             next_task: AtomicU64::new(1),
+            processes: Mutex::default(),
+            next_process: AtomicU64::new(1),
             status: Mutex::default(),
             subscriptions: Mutex::default(),
             diagnostics: Mutex::default(),
@@ -234,6 +366,7 @@ impl Shared {
     /// Withdraws a plugin's run-time state (it stopped or failed). Its
     /// subscriptions go only with `subscriptions`, as they survive restarts.
     pub fn clear_plugin(&self, plugin: &str, subscriptions: bool) {
+        self.kill_processes(plugin);
         let removed: Vec<String> = {
             let mut status = self.status.lock();
             let ids: Vec<String> = status.keys().filter(|(p, _)| p == plugin).map(|(_, id)| id.clone()).collect();
@@ -258,6 +391,19 @@ impl Shared {
         }
         if subscriptions && self.subscriptions.lock().remove(plugin).is_some() {
             self.sink.emit(None, PluginEvent::SubscriptionsChanged);
+        }
+    }
+
+    /// Ends every process `plugin` started: its handles go with its instance
+    /// (it stopped, was disabled, or was reclaimed while idle).
+    pub fn kill_processes(&self, plugin: &str) {
+        let mine: Vec<Arc<Proc>> = {
+            let mut processes = self.processes.lock();
+            let keys: Vec<(String, u64)> = processes.keys().filter(|(p, _)| p == plugin).cloned().collect();
+            keys.iter().filter_map(|k| processes.remove(k)).collect()
+        };
+        for proc in mine {
+            proc.kill();
         }
     }
 
@@ -322,6 +468,21 @@ impl PluginApi {
             ))
         })?;
         pin.verify().map(Path::to_path_buf).map_err(|e| HostError::Denied(format!("{cap}: {e}")))
+    }
+
+    /// Where `cmd` runs: the project root it names, else the plugin's data
+    /// directory (created as needed).
+    fn spawn_dir(&self, cwd: Option<&Path>) -> PathBuf {
+        let dir = cwd.map(Path::to_path_buf).unwrap_or_else(|| self.shared.data_dir.join(self.id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// The process handle `id`, if this plugin started it and it is still open.
+    fn process(&self, id: u64) -> Result<Arc<Proc>, HostError> {
+        self.shared.processes.lock().get(&(self.id().to_owned(), id)).cloned().ok_or_else(|| {
+            HostError::NotFound(format!("no process {id}: it was released, or belongs to another plugin"))
+        })
     }
 }
 
@@ -566,22 +727,21 @@ impl HostApi for PluginApi {
 
     fn run_process(
         &self,
-        program: &str,
-        args: Vec<String>,
+        cmd: ProcessCommand,
         cwd: Option<&Path>,
         stdin: Option<String>,
         cancel: &CancellationToken,
         timeout: Duration,
     ) -> Result<ProcessOutput, HostError> {
-        let binary = self.approved_program(program)?;
-        let cwd = cwd.map(Path::to_path_buf).unwrap_or_else(|| self.shared.data_dir.join(self.id()));
-        let _ = std::fs::create_dir_all(&cwd);
-        let mut child = std::process::Command::new(&binary)
-            .args(&args)
+        let binary = self.approved_program(&cmd.program)?;
+        let cwd = self.spawn_dir(cwd);
+        let mut child = StdCommand::new(&binary)
+            .args(&cmd.args)
+            .envs(cmd.env.iter().map(|(name, value)| (name, value)))
             .current_dir(&cwd)
-            .stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| HostError::Failed(format!("{}: {e}", binary.display())))?;
         if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
@@ -590,9 +750,8 @@ impl HostApi for PluginApi {
                 let _ = pipe.write_all(input.as_bytes());
             });
         }
-        let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let read = |pipe: Option<Box<dyn Read + Send>>| {
             std::thread::spawn(move || {
-                use std::io::Read;
                 let mut out = Vec::new();
                 if let Some(p) = pipe {
                     let _ = p.take(MAX_OUTPUT as u64).read_to_end(&mut out);
@@ -600,8 +759,8 @@ impl HostApi for PluginApi {
                 String::from_utf8_lossy(&out).into_owned()
             })
         };
-        let stdout = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
-        let stderr = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+        let stdout = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+        let stderr = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|e| HostError::Failed(e.to_string()))? {
@@ -613,7 +772,7 @@ impl HostApi for PluginApi {
                 return Err(if cancel.is_cancelled() {
                     HostError::Cancelled
                 } else {
-                    HostError::Failed(format!("{program} timed out after {timeout:?}"))
+                    HostError::Failed(format!("{} timed out after {timeout:?}", cmd.program))
                 });
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -623,6 +782,123 @@ impl HostApi for PluginApi {
             stdout: stdout.join().unwrap_or_default(),
             stderr: stderr.join().unwrap_or_default(),
         })
+    }
+
+    fn start_process(&self, cmd: ProcessCommand, cwd: Option<&Path>) -> Result<u64, HostError> {
+        let binary = self.approved_program(&cmd.program)?;
+        let cwd = self.spawn_dir(cwd);
+        {
+            let processes = self.shared.processes.lock();
+            let running = processes.keys().filter(|(plugin, _)| plugin == self.id()).count();
+            if running >= MAX_PROCESSES {
+                return Err(HostError::Invalid(format!(
+                    "at most {MAX_PROCESSES} processes may run at once: release one first"
+                )));
+            }
+        }
+        let mut child = StdCommand::new(&binary)
+            .args(&cmd.args)
+            .envs(cmd.env.iter().map(|(name, value)| (name, value)))
+            .current_dir(&cwd)
+            // Always piped: `write` may come later, and a plugin that never
+            // writes closes it (or loses it when it releases the handle).
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| HostError::Failed(format!("{}: {e}", binary.display())))?;
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let proc = Arc::new(Proc {
+            state: Mutex::new(ProcState {
+                stdin: child.stdin.take(),
+                child,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: None,
+                readers: 0,
+            }),
+        });
+        if let Some(pipe) = stdout {
+            proc.read(pipe, Stream::Out);
+        }
+        if let Some(pipe) = stderr {
+            proc.read(pipe, Stream::Err);
+        }
+        let id = self.shared.next_process.fetch_add(1, Ordering::Relaxed);
+        self.shared.processes.lock().insert((self.id().to_owned(), id), proc);
+        Ok(id)
+    }
+
+    fn poll_process(&self, id: u64, max: usize) -> Result<ProcessChunk, HostError> {
+        let proc = self.process(id)?;
+        proc.reap()?;
+        Ok(proc.chunk(max))
+    }
+
+    fn write_process(&self, id: u64, text: &str) -> Result<(), HostError> {
+        let proc = self.process(id)?;
+        let mut state = proc.state.lock();
+        if state.status.is_some() {
+            return Err(HostError::Failed("the process already ended".into()));
+        }
+        let Some(pipe) = state.stdin.as_mut() else {
+            return Err(HostError::Failed("its stdin is closed".into()));
+        };
+        use std::io::Write;
+        pipe.write_all(text.as_bytes())
+            .and_then(|()| pipe.flush())
+            .map_err(|e| HostError::Failed(format!("stdin: {e}")))
+    }
+
+    fn close_process_stdin(&self, id: u64) -> Result<(), HostError> {
+        let proc = self.process(id)?;
+        proc.state.lock().stdin = None;
+        Ok(())
+    }
+
+    fn kill_process(&self, id: u64) -> Result<(), HostError> {
+        self.process(id)?.kill();
+        Ok(())
+    }
+
+    fn wait_process(
+        &self,
+        id: u64,
+        max: usize,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<ProcessChunk, HostError> {
+        let proc = self.process(id)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            proc.reap()?;
+            let (ended, readers) = {
+                let state = proc.state.lock();
+                (state.status.is_some(), state.readers)
+            };
+            // Its output is only complete once its pipes reached the end too.
+            if ended && readers == 0 {
+                break;
+            }
+            if cancel.is_cancelled() {
+                return Err(HostError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(proc.chunk(max))
+    }
+
+    fn release_process(&self, id: u64) -> Result<(), HostError> {
+        let proc = self.shared.processes.lock().remove(&(self.id().to_owned(), id));
+        let Some(proc) = proc else {
+            return Err(HostError::NotFound(format!("no process {id}")));
+        };
+        // Releasing it while it runs ends it: the plugin can't reach it again.
+        proc.kill();
+        Ok(())
     }
 
     fn subscribe(&self, kind: EventKind, on: bool) {
@@ -1070,6 +1346,129 @@ mod tests {
         assert!(
             matches!(api.approved_program("lint"), Err(HostError::Denied(e)) if e.contains("changed since it was approved"))
         );
+    }
+
+    #[test]
+    fn take_text_splits_on_character_boundaries() {
+        // 1 + 2 + 3 bytes: 'a', 'é', '€'.
+        let mut buf = "aé€".as_bytes().to_vec();
+        assert_eq!(take_text(&mut buf, 2), "a", "the limit falls inside 'é', which waits");
+        assert_eq!(take_text(&mut buf, 2), "é");
+        assert_eq!(take_text(&mut buf, 1), "€", "a limit inside one character hands it over whole");
+        assert_eq!(take_text(&mut buf, 10), "");
+        assert!(buf.is_empty());
+        // A zero limit still moves the front forward: a plugin polling with one
+        // must not read the same bytes forever.
+        let mut buf = b"abc".to_vec();
+        assert_eq!(take_text(&mut buf, 0), "a");
+        assert_eq!(take_text(&mut buf, 0), "b");
+    }
+
+    /// The `git` on PATH. The process tests need a program that reads stdin and
+    /// reports its environment, and every machine running them has git.
+    fn git_on_path() -> Option<PathBuf> {
+        let name = if cfg!(windows) { "git.exe" } else { "git" };
+        std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(name)).find(|file| file.is_file())
+    }
+
+    /// An api of a plugin allowed to run `git` (pinned, as allowing it would).
+    fn api_running(dir: &Path, git: &Path) -> PluginApi {
+        let pins: Arc<RwLock<HashMap<(String, String), ProgramPin>>> = Arc::default();
+        pins.write().insert(("acme.lint".to_owned(), "process:git".to_owned()), ProgramPin::approve(git).unwrap());
+        api(dir, pins)
+    }
+
+    fn git_cmd(args: &[&str]) -> ProcessCommand {
+        ProcessCommand { program: "git".into(), args: args.iter().map(|a| (*a).to_owned()).collect(), env: Vec::new() }
+    }
+
+    #[test]
+    fn a_run_passes_its_environment_to_the_program() {
+        let Some(git) = git_on_path() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let api = api_running(&root, &git);
+        let mut cmd = git_cmd(&["var", "GIT_AUTHOR_IDENT"]);
+        cmd.env = vec![
+            ("GIT_AUTHOR_NAME".into(), "Openidea Bot".into()),
+            ("GIT_AUTHOR_EMAIL".into(), "bot@example.com".into()),
+            ("GIT_AUTHOR_DATE".into(), "2005-04-07T22:13:13 +0200".into()),
+        ];
+        let out = api.run_process(cmd, None, None, &CancellationToken::new(), Duration::from_secs(60)).unwrap();
+        assert_eq!(out.status, Some(0), "{}{}", out.stdout, out.stderr);
+        // Only the passed variables can name this author: whatever the machine's
+        // git config says, it is not "Openidea Bot".
+        assert!(out.stdout.starts_with("Openidea Bot <bot@example.com>"), "{}", out.stdout);
+    }
+
+    #[test]
+    fn a_kept_running_program_streams_reads_and_reports_its_end() {
+        let Some(git) = git_on_path() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let api = api_running(&root, &git);
+        let id = api.start_process(git_cmd(&["hash-object", "--stdin"]), None).unwrap();
+
+        // It is waiting for stdin: nothing printed yet, no status yet.
+        let chunk = api.poll_process(id, 4096).unwrap();
+        assert!(chunk.stdout.is_empty() && chunk.stderr.is_empty() && chunk.status.is_none(), "{chunk:?}");
+
+        api.write_process(id, "hello\n").unwrap();
+        api.close_process_stdin(id).unwrap();
+        let chunk = api.wait_process(id, 4096, Duration::from_secs(60), &CancellationToken::new()).unwrap();
+        assert_eq!(chunk.status, Some(0), "{chunk:?}");
+        assert_eq!(chunk.stdout.trim().len(), 40, "a sha1 in hex: {}", chunk.stdout);
+        assert!(chunk.stdout.trim().chars().all(|c| c.is_ascii_hexdigit()), "{}", chunk.stdout);
+
+        // Writing after it ended reports the problem instead of losing the bytes.
+        assert!(api.write_process(id, "more\n").is_err());
+        // Releasing takes the handle away for good.
+        api.release_process(id).unwrap();
+        assert!(matches!(api.poll_process(id, 16), Err(HostError::NotFound(_))));
+        assert!(matches!(api.release_process(id), Err(HostError::NotFound(_))));
+    }
+
+    #[test]
+    fn handles_are_capped_and_killing_frees_them_when_released() {
+        let Some(git) = git_on_path() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let api = api_running(&root, &git);
+        let mut ids: Vec<u64> = (0..MAX_PROCESSES)
+            .map(|_| api.start_process(git_cmd(&["hash-object", "--stdin"]), None).unwrap())
+            .collect();
+        let err = api.start_process(git_cmd(&["hash-object", "--stdin"]), None).unwrap_err();
+        assert!(matches!(&err, HostError::Invalid(m) if m.contains("at most 8 processes")), "{err}");
+
+        // Killing ends it right away, so its status is known rather than pending.
+        api.kill_process(ids[0]).unwrap();
+        let chunk = api.poll_process(ids[0], 64).unwrap();
+        assert!(chunk.status.is_some(), "{chunk:?}");
+        // Its slot is free once it is released, not when it dies.
+        assert!(api.start_process(git_cmd(&["hash-object", "--stdin"]), None).is_err());
+        api.release_process(ids.remove(0)).unwrap();
+        ids.push(api.start_process(git_cmd(&["hash-object", "--stdin"]), None).unwrap());
+
+        for id in ids {
+            api.release_process(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn stopping_a_plugin_kills_what_it_started() {
+        let Some(git) = git_on_path() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let api = api_running(&root, &git);
+        let id = api.start_process(git_cmd(&["hash-object", "--stdin"]), None).unwrap();
+        api.shared.kill_processes("acme.lint");
+        assert!(matches!(api.poll_process(id, 16), Err(HostError::NotFound(_))), "the handle is gone");
+        assert!(
+            api.start_process(git_cmd(&["hash-object", "--stdin"]), None).is_ok(),
+            "nothing is left holding a slot"
+        );
+        // Another plugin's processes are not touched.
+        assert!(api.shared.processes.lock().keys().all(|(plugin, _)| plugin == "acme.lint"));
     }
 }
 

@@ -8,6 +8,8 @@ activation = ["on-command:*"]
 
 [capabilities]
 required = ["project.read"]
+# The process tests run `git`, which every machine running them has.
+optional = ["process:git"]
 
 [[contributes.commands]]
 id = "echo"
@@ -64,3 +66,11 @@ title = "subscribe"
 [[contributes.commands]]
 id = "diagnose"
 title = "diagnose"
+
+[[contributes.commands]]
+id = "child"
+title = "child"
+
+[[contributes.commands]]
+id = "envrun"
+title = "envrun"
