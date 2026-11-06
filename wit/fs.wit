@@ -1,4 +1,4 @@
-package openidea:plugin@1.5.0;
+package openidea:plugin@1.6.0;
 
 /// Files outside the windows' projects: the configuration of the program a
 /// plugin integrates with, a tool installed elsewhere, a licence file.
@@ -39,8 +39,19 @@ interface fs {
     /// 16 MiB, atomically; the same failures as `write-text`, minus encoding.
     write-bytes: func(path: string, bytes: list<u8>) -> result<_, error>;
 
+    /// The entries directly under a directory, sorted by name — a directory of
+    /// libraries a plugin has to find the jars of. At most 4096 entries; a file
+    /// instead of a directory is `invalid`. Needs an `fs.read:<path>` grant
+    /// covering the directory.
+    read-dir: func(path: string) -> result<list<dir-entry>, error>;
+
     enum file-kind {
         file,
         directory,
+    }
+
+    record dir-entry {
+        name: string,
+        kind: file-kind,
     }
 }

@@ -5,8 +5,8 @@ wit_bindgen::generate!({
     inline: "
         package fixture:misbehave;
         world misbehave {
-            include openidea:plugin/plugin-syntax@1.5.0;
-            export openidea:plugin/providers@1.5.0;
+            include openidea:plugin/plugin-syntax@1.6.0;
+            export openidea:plugin/providers@1.6.0;
         }
     ",
     path: "../../../../../wit",
@@ -67,6 +67,20 @@ impl commands::Guest for Misbehave {
             // The `fs.write` grants: replaces the file at `arg`.
             "fswrite" => {
                 openidea::plugin::fs::write_text(&arg.unwrap_or_default(), "written by the plugin\n").map(|()| None)
+            }
+            // The `fs.read` grants: the entries of the directory at `arg`,
+            // one `name/` or `name` per line.
+            "fslist" => {
+                let entries = openidea::plugin::fs::read_dir(&arg.unwrap_or_default())?;
+                let mut out = String::new();
+                for entry in entries {
+                    out.push_str(&entry.name);
+                    if matches!(entry.kind, openidea::plugin::fs::FileKind::Directory) {
+                        out.push('/');
+                    }
+                    out.push('\n');
+                }
+                Ok(Some(out))
             }
             // The `project.write` grant: writes `arg` inside the project.
             "projwrite" => {

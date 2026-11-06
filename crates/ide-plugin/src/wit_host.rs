@@ -764,6 +764,22 @@ impl fs::Host for StoreData {
         }))
     }
 
+    fn read_dir(&mut self, path: String) -> Fallible<Vec<fs::DirEntry>> {
+        let real = match self.granted_file(&path) {
+            Ok(real) => real,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(self.host.list_dir(&real, sandbox::MAX_LIST_ENTRIES).map_err(to_wit).map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| fs::DirEntry {
+                    name: entry.name,
+                    kind: if entry.directory { fs::FileKind::Directory } else { fs::FileKind::File },
+                })
+                .collect()
+        }))
+    }
+
     fn write_text(&mut self, path: String, text: String) -> Fallible<()> {
         let real = match self.writable_file(&path) {
             Ok(real) => real,

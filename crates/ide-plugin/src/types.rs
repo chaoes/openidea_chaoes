@@ -63,6 +63,13 @@ pub enum PathKind {
     Directory,
 }
 
+/// One entry of a directory an `fs.read` grant covers (WIT `fs.dir-entry`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntryInfo {
+    pub name: String,
+    pub directory: bool,
+}
+
 /// A plugin's status bar item.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]

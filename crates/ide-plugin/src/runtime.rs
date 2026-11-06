@@ -5,8 +5,8 @@
 
 use crate::types::{CodeAction, CompletionItem, InlineSuggestion, LineMarker, Location, ProviderDocument};
 use crate::types::{
-    EventKind, HostError, HttpRequest, HttpResponse, Invocation, Limits, NotificationLevel, PathKind, ProcessOutput,
-    RepositoryStatus, StatusItem, SyntaxFold, SyntaxSymbol, SyntaxToken, WorkbenchEvent,
+    DirEntryInfo, EventKind, HostError, HttpRequest, HttpResponse, Invocation, Limits, NotificationLevel, PathKind,
+    ProcessOutput, RepositoryStatus, StatusItem, SyntaxFold, SyntaxSymbol, SyntaxToken, WorkbenchEvent,
 };
 use crate::types::{
     FieldValue, View, ViewBody, ViewButton, ViewEvent, ViewField, ViewListItem, ViewTable, ViewTreeItem, Viewport,
@@ -34,7 +34,7 @@ use views_bindings::exports::openidea::plugin::view_provider as wit_view;
 use views_bindings::openidea::plugin::view_types as wit_vt;
 
 /// The API version of the world above, `major.minor` of [`host_api`].
-pub const API_VERSION: &str = "1.5";
+pub const API_VERSION: &str = "1.6";
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 pub(crate) const MAX_TEXT: usize = 1 << 20;
 pub(crate) const MAX_TITLE: usize = 256;
@@ -130,6 +130,9 @@ pub trait HostApi: Send + Sync {
     fn read_bytes_file(&self, real: &Path, max: usize) -> Result<Vec<u8>, HostError>;
     /// Whether the granted path is a file or a directory.
     fn path_kind(&self, real: &Path) -> Result<PathKind, HostError>;
+    /// The entries directly under a granted directory, sorted by name; `max`
+    /// bounds how many.
+    fn list_dir(&self, real: &Path, max: usize) -> Result<Vec<DirEntryInfo>, HostError>;
     /// Replaces the text of a file outside the project, whose real path an
     /// `fs.write` grant already covers: atomically, keeping its encoding and
     /// BOM. `max` bounds the bytes written.

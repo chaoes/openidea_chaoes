@@ -90,7 +90,7 @@ pub mod providers_bindings {
         export_macro_name: "__export_editor_providers_world",
         default_bindings_module: "openidea_plugin::providers_bindings",
         with: {
-            "openidea:plugin/types@1.5.0": crate::bindings::openidea::plugin::types,
+            "openidea:plugin/types@1.6.0": crate::bindings::openidea::plugin::types,
         },
     });
 }
@@ -107,10 +107,10 @@ pub mod views_bindings {
         export_macro_name: "__export_views_world",
         default_bindings_module: "openidea_plugin::views_bindings",
         with: {
-            "openidea:plugin/types@1.5.0": crate::bindings::openidea::plugin::types,
-            "openidea:plugin/workspace@1.5.0": crate::bindings::openidea::plugin::workspace,
-            "openidea:plugin/editor@1.5.0": crate::bindings::openidea::plugin::editor,
-            "openidea:plugin/invocation@1.5.0": crate::bindings::openidea::plugin::invocation,
+            "openidea:plugin/types@1.6.0": crate::bindings::openidea::plugin::types,
+            "openidea:plugin/workspace@1.6.0": crate::bindings::openidea::plugin::workspace,
+            "openidea:plugin/editor@1.6.0": crate::bindings::openidea::plugin::editor,
+            "openidea:plugin/invocation@1.6.0": crate::bindings::openidea::plugin::invocation,
         },
     });
 }
@@ -122,12 +122,12 @@ pub mod indexing_bindings {
         world: "indexing", path: "wit", pub_export_macro: true,
         export_macro_name: "__export_indexing_world",
         default_bindings_module: "openidea_plugin::indexing_bindings",
-        with: { "openidea:plugin/types@1.5.0": crate::bindings::openidea::plugin::types },
+        with: { "openidea:plugin/types@1.6.0": crate::bindings::openidea::plugin::types },
     });
 }
 
 /// The plugin API version this SDK targets.
-pub const API_VERSION: &str = "1.5";
+pub const API_VERSION: &str = "1.6";
 
 /// A plugin. One instance lives as long as the plugin's Wasm instance (until
 /// it is disabled, crashes or is reclaimed when idle).

@@ -772,6 +772,26 @@ impl HostApi for PluginApi {
         Ok(if meta.is_dir() { ide_plugin::PathKind::Directory } else { ide_plugin::PathKind::File })
     }
 
+    fn list_dir(&self, real: &Path, max: usize) -> Result<Vec<ide_plugin::DirEntryInfo>, HostError> {
+        let meta = std::fs::metadata(real).map_err(|e| not_a_file(real, e))?;
+        if !meta.is_dir() {
+            return Err(HostError::Invalid(format!("{}: not a directory", real.display())));
+        }
+        let read = std::fs::read_dir(real).map_err(|e| not_a_file(real, e))?;
+        let mut entries = Vec::new();
+        for entry in read.flatten() {
+            if entries.len() == max {
+                break;
+            }
+            let directory = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            entries
+                .push(ide_plugin::DirEntryInfo { name: entry.file_name().to_string_lossy().into_owned(), directory });
+        }
+        // Sorted, so a plugin's pick of "the first jar" doesn't depend on the disk.
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
     fn write_text_file(&self, real: &Path, text: &str, max: usize) -> Result<(), HostError> {
         if text.len() > max {
             return Err(too_much_to_write(real, max));
