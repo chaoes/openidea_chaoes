@@ -55,8 +55,10 @@ struct State {
     root: Option<String>,
     other_projects: Vec<String>,
     files: BTreeMap<String, String>,
-    /// Files outside every project, for `fs.read` (absolute paths).
+    /// Files outside every project, for `fs` (absolute paths).
     external: BTreeMap<String, String>,
+    /// The same, for what `fs_write_bytes` put there.
+    external_bytes: BTreeMap<String, Vec<u8>>,
     editor: Option<Editor>,
     notifications: Vec<Notification>,
     logs: Vec<(LogLevel, String)>,
@@ -146,9 +148,10 @@ impl MockHost {
         self.state.borrow_mut().files.insert(path.to_owned(), text.to_owned());
     }
 
-    /// A file outside every project, for [`crate::host::fs_read_text`]: it is
-    /// readable once an `fs.read:<a directory above it>` capability is granted.
-    /// Directories are inferred from the paths it holds.
+    /// A file outside every project, for [`crate::host::fs_read_text`] and
+    /// [`crate::host::fs_write_text`]: it is readable once an
+    /// `fs.read:<a directory above it>` capability is granted, writable with
+    /// `fs.write:`. Directories are inferred from the paths the mock holds.
     pub fn add_external_file(&self, path: &str, text: &str) {
         self.state.borrow_mut().external.insert(path.to_owned(), text.to_owned());
     }
@@ -370,10 +373,11 @@ pub mod current {
         if s.capabilities.iter().any(|c| c == cap) { Ok(()) } else { Err(Error::Denied(cap.to_owned())) }
     }
 
-    /// `fs.read:<base>` covers `<base>` itself and what is under it: `/a` covers
-    /// `/a/b` but not `/ab`.
-    fn require_fs(s: &State, path: &str) -> Result<(), Error> {
-        let covered = s.capabilities.iter().any(|c| match c.strip_prefix("fs.read:") {
+    /// `fs.read:<base>` (or `fs.write:<base>`) covers `<base>` itself and what is
+    /// under it: `/a` covers `/a/b` but not `/ab`.
+    fn require_fs(s: &State, kind: &str, path: &str) -> Result<(), Error> {
+        let prefix = format!("{kind}:");
+        let covered = s.capabilities.iter().any(|c| match c.strip_prefix(&prefix) {
             Some(base) => {
                 let base = base.trim_end_matches(['/', '\\']);
                 !base.is_empty()
@@ -382,7 +386,7 @@ pub mod current {
             }
             None => false,
         });
-        if covered { Ok(()) } else { Err(Error::Denied(format!("fs.read:{path}"))) }
+        if covered { Ok(()) } else { Err(Error::Denied(format!("{prefix}{path}"))) }
     }
 
     /// The paths `fs` takes are absolute; `~/…` is the user's home on the real
@@ -400,11 +404,57 @@ pub mod current {
         }
     }
 
-    /// `fs` checks what the real host checks, minus canonicalisation: absolute
-    /// path, then a grant covering it.
-    fn check_external(s: &State, path: &str) -> Result<(), Error> {
+    /// What the real host does before it touches a path: an absolute path (a
+    /// grant names absolute paths only, so this comes first), then a grant
+    /// covering it — the runtime checks capabilities before it resolves
+    /// anything, so a missing grant wins over "no such file".
+    fn check_external(s: &State, kind: &str, path: &str) -> Result<(), Error> {
         check_absolute(path)?;
-        require_fs(s, path)
+        require_fs(s, kind, path)
+    }
+
+    /// The directory `path` lives in: `/a/b` → `/a`, `/a` → `/`, `C:\a` → `C:\`.
+    fn parent_dir(path: &str) -> Option<&str> {
+        let cut = path.rfind(['/', '\\'])?;
+        let root = cut == 0 || (cut == 2 && path.as_bytes()[1] == b':');
+        Some(&path[..if root { cut + 1 } else { cut }])
+    }
+
+    /// Files the mock holds under `dir`.
+    fn has_children(s: &State, dir: &str) -> bool {
+        let under =
+            |p: &String| matches!(p.strip_prefix(dir), Some(rest) if rest.starts_with('/') || rest.starts_with('\\'));
+        s.external.keys().any(under) || s.external_bytes.keys().any(under)
+    }
+
+    /// The mock holds no file system, so a directory exists when a grant names
+    /// it or a registered file lives under it — plus the root of a volume.
+    fn dir_exists(s: &State, dir: &str) -> bool {
+        let dir = dir.trim_end_matches(['/', '\\']);
+        if dir.is_empty() || dir.ends_with(':') {
+            return true;
+        }
+        let granted = ["fs.read:", "fs.write:"].iter().any(|kind| {
+            s.capabilities
+                .iter()
+                .filter_map(|c| c.strip_prefix(kind))
+                .any(|base| base.trim_end_matches(['/', '\\']) == dir)
+        });
+        granted || has_children(s, dir)
+    }
+
+    /// What a write has to get past: an `fs.write` grant, a path that is not a
+    /// directory, and a parent directory that exists.
+    fn check_writable(s: &State, path: &str) -> Result<(), Error> {
+        check_external(s, "fs.write", path)?;
+        if has_children(s, path) {
+            return Err(Error::Invalid(format!("{path}: is a directory")));
+        }
+        match parent_dir(path) {
+            Some(dir) if dir_exists(s, dir) => Ok(()),
+            Some(dir) => Err(Error::Invalid(format!("{dir}: no such directory"))),
+            None => Err(Error::Invalid(format!("{path}: expected a file path"))),
+        }
     }
 
     pub fn log(level: LogLevel, message: &str) {
@@ -504,18 +554,28 @@ pub mod current {
 
     pub fn fs_read_text(path: &str) -> Result<String, Error> {
         with(|s| {
-            check_external(s, path)?;
+            check_external(s, "fs.read", path)?;
             // Unsaved editor contents win, as on the real host.
             if let Some(e) = s.editor.as_ref().filter(|e| e.path == path) {
                 return Ok(e.text.clone());
             }
-            s.external.get(path).cloned().ok_or_else(|| Error::NotFound(path.into()))
+            if let Some(text) = s.external.get(path) {
+                return Ok(text.clone());
+            }
+            match s.external_bytes.get(path) {
+                Some(bytes) => String::from_utf8(bytes.clone())
+                    .map_err(|_| Error::Invalid(format!("{path}: not valid UTF-8 text"))),
+                None => Err(Error::NotFound(path.into())),
+            }
         })
     }
 
     pub fn fs_read_bytes(path: &str) -> Result<Vec<u8>, Error> {
         with(|s| {
-            check_external(s, path)?;
+            check_external(s, "fs.read", path)?;
+            if let Some(bytes) = s.external_bytes.get(path) {
+                return Ok(bytes.clone());
+            }
             let text = s.external.get(path).ok_or_else(|| Error::NotFound(path.into()))?;
             Ok(text.clone().into_bytes())
         })
@@ -523,15 +583,30 @@ pub mod current {
 
     pub fn fs_path_kind(path: &str) -> Result<PathKind, Error> {
         with(|s| {
-            check_external(s, path)?;
-            if s.external.contains_key(path) {
+            check_external(s, "fs.read", path)?;
+            if s.external.contains_key(path) || s.external_bytes.contains_key(path) {
                 return Ok(PathKind::File);
             }
             // A directory is a prefix of the files the mock holds.
-            let holds_files = s.external.keys().any(
-                |file| matches!(file.strip_prefix(path), Some(rest) if rest.starts_with('/') || rest.starts_with('\\')),
-            );
-            if holds_files { Ok(PathKind::Directory) } else { Err(Error::NotFound(path.into())) }
+            if has_children(s, path) { Ok(PathKind::Directory) } else { Err(Error::NotFound(path.into())) }
+        })
+    }
+
+    pub fn fs_write_text(path: &str, text: &str) -> Result<(), Error> {
+        with(|s| {
+            check_writable(s, path)?;
+            s.external_bytes.remove(path);
+            s.external.insert(path.to_owned(), text.to_owned());
+            Ok(())
+        })
+    }
+
+    pub fn fs_write_bytes(path: &str, bytes: &[u8]) -> Result<(), Error> {
+        with(|s| {
+            check_writable(s, path)?;
+            s.external.remove(path);
+            s.external_bytes.insert(path.to_owned(), bytes.to_vec());
+            Ok(())
         })
     }
 
@@ -913,5 +988,44 @@ mod tests {
             host::fs_read_text("/opt/seeyon/missing.properties"),
             Err(Error::NotFound("/opt/seeyon/missing.properties".into()))
         );
+    }
+
+    #[test]
+    fn fs_write_needs_a_grant_of_its_own() {
+        // `fs.read` does not let a plugin write.
+        let mock = MockHost::install().with_capabilities(&["fs.read:/opt/seeyon"]);
+        mock.add_external_file("/opt/seeyon/app.properties", "name=YonBIP\n");
+        assert_eq!(
+            host::fs_write_text("/opt/seeyon/app.properties", "name=YonBIP2\n"),
+            Err(Error::Denied("fs.write:/opt/seeyon/app.properties".into()))
+        );
+        assert_eq!(host::fs_read_text("/opt/seeyon/app.properties").unwrap(), "name=YonBIP\n");
+
+        // Nor does `fs.write` imply reading.
+        let mock = MockHost::install().with_capabilities(&["fs.write:/opt/seeyon"]);
+        mock.add_external_file("/opt/seeyon/app.properties", "name=YonBIP\n");
+        host::fs_write_text("/opt/seeyon/app.properties", "name=YonBIP2\n").unwrap();
+        assert_eq!(
+            host::fs_read_text("/opt/seeyon/app.properties"),
+            Err(Error::Denied("fs.read:/opt/seeyon/app.properties".into()))
+        );
+
+        let mock = MockHost::install().with_capabilities(&["fs.read:/opt/seeyon", "fs.write:/opt/seeyon"]);
+        mock.add_external_file("/opt/seeyon/app.properties", "name=YonBIP\n");
+        mock.add_external_file("/opt/seeyon/conf/licence.xml", "<licence/>");
+        host::fs_write_text("/opt/seeyon/app.properties", "name=YonBIP2\n").unwrap();
+        assert_eq!(host::fs_read_text("/opt/seeyon/app.properties").unwrap(), "name=YonBIP2\n");
+        assert_eq!(host::fs_read_bytes("/opt/seeyon/app.properties").unwrap(), b"name=YonBIP2\n".to_vec());
+        // A file that was not there is created; bytes stay bytes.
+        host::fs_write_bytes("/opt/seeyon/blob.bin", &[0xff, 0x00, 0x7f]).unwrap();
+        assert_eq!(host::fs_read_bytes("/opt/seeyon/blob.bin").unwrap(), [0xff, 0x00, 0x7f]);
+        assert_eq!(host::fs_path_kind("/opt/seeyon/blob.bin"), Ok(PathKind::File));
+        assert!(matches!(host::fs_read_text("/opt/seeyon/blob.bin"), Err(Error::Invalid(_))));
+
+        // Relative paths are path errors, a directory is not a file, and a
+        // missing parent directory is not created.
+        assert!(matches!(host::fs_write_text("opt/seeyon/app.properties", "x"), Err(Error::Invalid(_))));
+        assert!(matches!(host::fs_write_text("/opt/seeyon/conf", "x"), Err(Error::Invalid(_))));
+        assert!(matches!(host::fs_write_bytes("/opt/seeyon/no/dir/x.bin", &[1]), Err(Error::Invalid(_))));
     }
 }

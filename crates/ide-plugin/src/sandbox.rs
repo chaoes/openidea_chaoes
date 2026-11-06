@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 /// Largest file `read-file` returns.
 pub const MAX_READ_BYTES: u64 = 16 << 20;
 
+/// Largest file one `fs.write-*` call may replace.
+pub const MAX_WRITE_BYTES: usize = 16 << 20;
+
 /// Resolves `path` (absolute, or relative to `root`) and checks that the real
 /// path — after following `..` and symlinks — stays inside `root`.
 pub fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf, String> {
@@ -35,12 +38,13 @@ pub fn read_text(real: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8 text", real.display()))
 }
 
-/// Why a read outside the project was refused.
+/// Why a read or write outside the project was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// No `fs.read:<path>` grant covers the file; names the capability to declare.
+    /// No `fs.read:<path>` / `fs.write:<path>` grant covers the file; names the
+    /// capability to declare.
     Denied(String),
-    /// The path cannot be read as asked.
+    /// The path cannot be read or written as asked.
     Invalid(String),
 }
 
@@ -62,6 +66,30 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// Which grant a path is resolved against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wanted {
+    Read,
+    Write,
+}
+
+impl Wanted {
+    fn capability(self, plain: String) -> Capability {
+        match self {
+            Self::Read => Capability::FsRead(plain),
+            Self::Write => Capability::FsWrite(plain),
+        }
+    }
+
+    /// `fs.read` / `fs.write`, for messages.
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Read => "fs.read",
+            Self::Write => "fs.write",
+        }
+    }
+}
+
 /// The real path of `path` when an `fs.read:<path>` grant covers it.
 ///
 /// The grant is compared with the **real** path, so a symlink pointing out of
@@ -69,28 +97,60 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// not `/srv/application`. Windows' `\\?\` prefix (what `canonicalize` adds)
 /// is stripped from the file side so a manifest may spell `C:\Program Files\X`.
 pub fn resolve_granted(granted: &[Capability], path: &str) -> Result<PathBuf, Refusal> {
+    resolve(granted, path, Wanted::Read)
+}
+
+/// The real path `path` would be written to, when an `fs.write:<path>` grant
+/// covers it.
+///
+/// A file that does not exist yet cannot be canonicalized, so its directory is
+/// canonicalized instead and the name appended; an existing file (or link) is
+/// followed first, so a link cannot be used to write outside the grant.
+pub fn resolve_writable(granted: &[Capability], path: &str) -> Result<PathBuf, Refusal> {
+    resolve(granted, path, Wanted::Write)
+}
+
+fn resolve(granted: &[Capability], path: &str, wanted: Wanted) -> Result<PathBuf, Refusal> {
     let asked = expand_tilde(path);
     if !asked.is_absolute() {
         return Err(Refusal::Invalid(format!("{path}: use an absolute path (or ~/…)")));
     }
-    let real = asked.canonicalize().map_err(|_| Refusal::Invalid(format!("{path}: no such file")))?;
+    let real = match wanted {
+        Wanted::Read => asked.canonicalize().map_err(|_| Refusal::Invalid(format!("{path}: no such file")))?,
+        Wanted::Write => asked
+            .canonicalize()
+            .or_else(|_| resolve_unsaved(&asked))
+            .map_err(|e| Refusal::Invalid(format!("{path}: {e}")))?,
+    };
     let plain = strip_verbatim(&real);
-    let cap = Capability::FsRead(plain.clone());
+    let cap = wanted.capability(plain.clone());
     let mut covered = false;
     for grant in granted {
-        let Capability::FsRead(base) = grant else { continue };
+        let base = match (wanted, grant) {
+            (Wanted::Read, Capability::FsRead(base)) | (Wanted::Write, Capability::FsWrite(base)) => base,
+            _ => continue,
+        };
         if !grant.covers(&cap) {
             continue;
         }
         // A directory that is its own parent is a root: `/`, `C:\`.
         if Path::new(base).parent().is_none() {
             return Err(Refusal::Invalid(format!(
-                "{plain}: fs.read:{base} covers a whole file system; declare a directory"
+                "{plain}: {}:{base} covers a whole file system; declare a directory",
+                wanted.prefix()
             )));
         }
         covered = true;
     }
     if covered { Ok(real) } else { Err(Refusal::Denied(cap.to_string())) }
+}
+
+/// Where `asked` would be created: its directory, resolved, plus its name.
+fn resolve_unsaved(asked: &Path) -> Result<PathBuf, String> {
+    let name = asked.file_name().ok_or_else(|| "not a file name".to_string())?;
+    let parent = asked.parent().ok_or_else(|| "no directory to put it in".to_string())?;
+    let dir = parent.canonicalize().map_err(|_| "its directory does not exist".to_string())?;
+    Ok(dir.join(name))
 }
 
 /// `\\?\C:\…` (what `canonicalize` returns on Windows) as `C:\…`.
@@ -253,5 +313,85 @@ mod tests {
             PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap())
         );
         assert_eq!(expand_tilde("relative/x"), PathBuf::from("relative/x"));
+    }
+
+    /// The write grant a manifest author would write for `dir`.
+    fn write_grant_for(dir: &Path) -> Capability {
+        Capability::FsWrite(strip_verbatim(&dir.canonicalize().unwrap()))
+    }
+
+    #[test]
+    fn a_write_needs_its_own_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let granted = tmp.path().join("seeyon");
+        std::fs::create_dir_all(&granted).unwrap();
+        let target = granted.join("web.xml");
+
+        // A read grant does not allow writing.
+        let err = resolve_writable(&[grant_for(&granted)], target.to_str().unwrap()).unwrap_err();
+        match err {
+            Refusal::Denied(cap) => assert!(cap.starts_with("fs.write:"), "{cap}"),
+            other => panic!("expected denied, got {other:?}"),
+        }
+
+        // A write grant allows a file that is not there yet, and one that is.
+        let cap = write_grant_for(&granted);
+        let planned = resolve_writable(std::slice::from_ref(&cap), target.to_str().unwrap()).unwrap();
+        assert_eq!(planned, granted.canonicalize().unwrap().join("web.xml"));
+        std::fs::write(&target, "<web/>").unwrap();
+        assert_eq!(resolve_writable(&[cap], target.to_str().unwrap()).unwrap(), target.canonicalize().unwrap());
+
+        // …and still does not allow reading.
+        let err = resolve_granted(&[write_grant_for(&granted)], target.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, Refusal::Denied(ref cap) if cap.starts_with("fs.read:")), "{err:?}");
+    }
+
+    #[test]
+    fn a_write_needs_a_directory_that_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let granted = tmp.path().join("seeyon");
+        std::fs::create_dir_all(&granted).unwrap();
+        let cap = write_grant_for(&granted);
+
+        let missing = granted.join("conf").join("web.xml");
+        let err = resolve_writable(std::slice::from_ref(&cap), missing.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, Refusal::Invalid(ref m) if m.contains("directory does not exist")), "{err:?}");
+
+        let err = resolve_writable(&[cap], "web.xml").unwrap_err();
+        assert!(matches!(err, Refusal::Invalid(ref m) if m.contains("absolute")), "{err:?}");
+    }
+
+    #[test]
+    fn a_write_through_a_symlink_must_land_inside_the_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let granted = tmp.path().join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let secret = text_at(tmp.path(), "secret.txt", "s");
+        let cap = write_grant_for(&granted);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, granted.join("link")).unwrap();
+            let err = resolve_writable(&[cap], granted.join("link").to_str().unwrap()).unwrap_err();
+            assert!(matches!(err, Refusal::Denied(_)), "{err:?}");
+        }
+        #[cfg(windows)]
+        {
+            // Creating symlinks needs a privilege tests do not have; the
+            // resolution still goes through `canonicalize` on Windows.
+            let _ = secret;
+            assert!(resolve_writable(&[cap], granted.join("new.txt").to_str().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_root_write_grant_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.txt");
+        #[cfg(windows)]
+        let cap = Capability::FsWrite(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())));
+        #[cfg(unix)]
+        let cap = Capability::FsWrite("/".into());
+        let err = resolve_writable(&[cap], target.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, Refusal::Invalid(ref m) if m.contains("whole file system")), "{err:?}");
     }
 }

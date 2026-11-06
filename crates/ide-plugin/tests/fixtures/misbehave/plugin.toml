@@ -38,6 +38,10 @@ id = "fsread"
 title = "fsread"
 
 [[contributes.commands]]
+id = "fswrite"
+title = "fswrite"
+
+[[contributes.commands]]
 id = "insert"
 title = "insert"
 

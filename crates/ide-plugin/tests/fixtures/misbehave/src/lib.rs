@@ -5,8 +5,8 @@ wit_bindgen::generate!({
     inline: "
         package fixture:misbehave;
         world misbehave {
-            include openidea:plugin/plugin-syntax@1.3.0;
-            export openidea:plugin/providers@1.3.0;
+            include openidea:plugin/plugin-syntax@1.4.0;
+            export openidea:plugin/providers@1.4.0;
         }
     ",
     path: "../../../../../wit",
@@ -64,6 +64,10 @@ impl commands::Guest for Misbehave {
             "root" => ctx.project().map(|p| p.root()).transpose(),
             // The `fs.read` grants: the text of `arg`, or the refusal naming what it needs.
             "fsread" => openidea::plugin::fs::read_text(&arg.unwrap_or_default()).map(Some),
+            // The `fs.write` grants: replaces the file at `arg`.
+            "fswrite" => {
+                openidea::plugin::fs::write_text(&arg.unwrap_or_default(), "written by the plugin\n").map(|()| None)
+            }
             // `editor.write` is not granted: an error, not a trap.
             "insert" => {
                 let editor = ctx.editor().ok_or_else(|| failed("no editor"))?;
