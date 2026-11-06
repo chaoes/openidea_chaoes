@@ -24,6 +24,7 @@ import {
   type Variable,
 } from "@/platform/ipc";
 import { confirmTerminate } from "@/workbench/confirmTerminate";
+import { onRunLines, runLines } from "@/features/run/store";
 import { maybeEditorService, notifications, toolWindowService, useDebugRunSessions } from "@/workbench/contributions";
 import { breakpointsOf, consumeTemporary, flushBreakpoints, refreshStates, resetStatuses } from "./breakpoints/store";
 import { interpolateLog, logParts, suspends } from "./breakpoints/model";
@@ -340,6 +341,40 @@ export function publishContext() {
   );
 }
 
+// --- console of a process this IDE started ------------------------------------
+
+/** Sessions mirroring the output of a run they attached to, and how to stop mirroring. */
+const runMirrors = new Map<DebugSessionId, () => void>();
+
+function stopMirroring(session: DebugSessionId) {
+  const stop = runMirrors.get(session);
+  if (stop) {
+    stop();
+    runMirrors.delete(session);
+  }
+}
+
+/**
+ * A debugger that attached to a process the IDE started (`JAVA_TOOL_OPTIONS=-agentlib:jdwp…`, Maven
+ * with the surefire agent, …) owns no output stream of its own: the process prints into the run's
+ * console. Show those lines in the debug console too, the way IDEA's Debug console shows the output
+ * of the JVM it launched, instead of leaving it empty.
+ */
+function mirrorRunOutput(session: DebugSessionId, run: RunId) {
+  stopMirroring(session);
+  for (const line of runLines(run)) if (line.kind !== "system") appendConsole(session, line.kind, line.text + "\n");
+  runMirrors.set(
+    session,
+    onRunLines(run, (text, kind) => {
+      if (kind === "system") return;
+      if (!useDebug.getState().sessions[session]) {
+        stopMirroring(session);
+        return;
+      }
+      appendConsole(session, kind, `${text}\n`);
+    }),
+  );
+}
 // --- console -----------------------------------------------------------------
 
 export function appendConsole(session: DebugSessionId, category: string, raw: string) {
@@ -565,6 +600,7 @@ export async function startSession(
         active: id,
       };
     });
+    if (options.process) mirrorRunOutput(id, options.process);
     settleStart(id);
     publishContext();
     void refreshExceptionFilters();
@@ -713,6 +749,7 @@ export function sessionSupports(cap: keyof DebugCapabilities, s: DebugSession | 
 }
 
 function markTerminated(id: DebugSessionId) {
+  stopMirroring(id);
   patch(id, { status: "terminated", endedAt: Date.now(), frames: [], selectedFrame: null, stoppedThread: null });
   const st = useDebug.getState();
   if (st.active === id) {

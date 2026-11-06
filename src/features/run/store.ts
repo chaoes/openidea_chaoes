@@ -30,7 +30,7 @@ import { useProject } from "@/platform/project";
 import { executeAction } from "@/platform/actions";
 import { workflowSettings } from "@/platform/workflowSettings";
 import { maybeEditorService, notifications, toolWindowService, useDebugRunSessions } from "@/workbench/contributions";
-import { ConsoleModel } from "./console";
+import { ConsoleModel, type ChunkKind } from "./console";
 import { jvmFrameTarget } from "./links";
 import { confirmRerun, confirmTerminate } from "./dialogs";
 import {
@@ -96,7 +96,7 @@ interface SessionRuntime {
   /** Bumped per start so output from a previous run in the same tab is ignored. */
   generation: number;
   /** Called with every complete output line (e.g. waiting for a JDWP agent). */
-  lineListeners: Array<(text: string) => void>;
+  lineListeners: Array<(text: string, kind: ChunkKind) => void>;
   /** Called once the process exited (run executors: collect a coverage report…). */
   onExit?: (exitCode: number | null, stopped: boolean) => void;
   /** User input typed into the console, not yet sent (IDEA: Enter sends the line). */
@@ -475,6 +475,33 @@ export async function saveUserConfigs(user: RunConfig[], removedDetectedIds: str
   await loadConfigs();
 }
 
+/** The runtime of a run, by session id (`run3`) or by the numeric id a debug session records. */
+function runtimeOf(session: RunId | string): SessionRuntime | undefined {
+  const direct = runtimes.get(String(session));
+  if (direct) return direct;
+  const found = useRun.getState().sessions.find((s) => s.runId === session || s.id === String(session));
+  return found ? runtimes.get(found.id) : undefined;
+}
+/** The lines a run has printed so far, for another console that mirrors it. */
+export function runLines(session: RunId | string): Array<{ text: string; kind: ChunkKind }> {
+  const rt = runtimeOf(session);
+  if (!rt) return [];
+  return rt.console.lines.map((line) => ({ text: line.text, kind: line.kind }));
+}
+/**
+ * Every complete output line of this run, until the returned function is called. A debugger that
+ * attached to a process the IDE started shows them in its own console (IDEA does the same).
+ */
+export function onRunLines(session: RunId | string, onLine: (text: string, kind: ChunkKind) => void): () => void {
+  const rt = runtimeOf(session);
+  if (!rt) return () => {};
+  rt.lineListeners.push(onLine);
+  return () => {
+    const i = rt.lineListeners.indexOf(onLine);
+    if (i >= 0) rt.lineListeners.splice(i, 1);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 
@@ -586,7 +613,7 @@ function newRuntime(config: RunConfig): SessionRuntime {
       maxChars: consoleCharLimit(),
       onLine: (text, kind) => {
         if (parser && tests && kind !== "system" && !(kind === "stdout" && stdout)) tests.apply(parser.feed(text));
-        if (kind !== "system") for (const l of runtime.lineListeners) l(text);
+        if (kind !== "system") for (const l of runtime.lineListeners) l(text, kind);
       },
     }),
     queue: [],
